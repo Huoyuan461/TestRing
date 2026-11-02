@@ -1,0 +1,83 @@
+# Dependencies
+node_modules
+package-lock.json
+
+# Build output
+dist
+out
+.next
+next-env.d.ts
+*.tsbuildinfo
+
+# Written by CI/deploy workflows
+buildinfo/
+back-end-dist/
+
+# Deployment
+charts/**/*.tgz
+preview/Dockerfile.generated
+
+# Tool caches
+.eslintcache
+.jest-cache
+
+# Test coverage
+coverage
+coverage.xml
+.coverage
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local environment and config
+.env.local
+.env.local.*
+# Self-hosted data source/metric config
+config.yml
+
+# Editors and OS
+.DS_Store
+.idea
+.vscode/*
+!.vscode/launch.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.tox
+.ipynb_checkpoints
+venv/
+.venv/
+
+# Docs
+docs/build
+.docusaurus
+.cache-loader
+
+# Back-end
+uploads
+packages/back-end/globalConfig.json
+packages/back-end/dummy
+
+# Agent skills: keep the skills-src placeholder; ignore the local checkout
+# pointer and the assembled output.
+skills-src/*
+!skills-src/.gitkeep
+packages/back-end/agent-skills.local.json
+packages/back-end/generated/agent-skills/
+
+# SDKs
+packages/sdk-js/scripts/test-cases--typed.json
+
+# Stats engine
+packages/stats/notebooks
+
+# AI agents: private Claude folders and agent scratch space
+.claude/worktrees/
+.claude/projects/
+.claude/launch.json
+.context/

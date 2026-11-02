@@ -1,0 +1,111 @@
+import { useState } from "react";
+import { Flex } from "@radix-ui/themes";
+import LoadingOverlay from "@/components/LoadingOverlay";
+import RichTextEditor, { RichTextHeight } from "@/ui/RichTextEditor";
+import Button from "@/ui/Button";
+import HelperText from "@/ui/HelperText";
+
+export interface CommentComposerProps {
+  /**
+   * Async submission handler. Receives the composer's current value and
+   * should throw to surface an error message inline. The composer manages
+   * its own loading and error state.
+   */
+  onSubmit: (value: string) => Promise<void>;
+  cta?: string;
+  placeholder?: string;
+  initialValue?: string;
+  autofocus?: boolean;
+  // When autofocus is set, drop the caret at the end of `initialValue`
+  // rather than the start — useful when seeding boilerplate the user
+  // should type after.
+  autofocusAtEnd?: boolean;
+  onCancel?: () => void;
+  /** Resting height; the editor grows with the text up to `maxHeight`. */
+  height?: RichTextHeight;
+  maxHeight?: RichTextHeight;
+  /** For narrow surfaces: small buttons. */
+  compact?: boolean;
+}
+
+// Owns value/loading/error state; the caller only supplies the network call.
+export default function CommentComposer({
+  onSubmit,
+  cta = "Comment",
+  placeholder,
+  initialValue = "",
+  autofocus,
+  autofocusAtEnd,
+  onCancel,
+  height = "sm",
+  maxHeight,
+  compact = false,
+}: CommentComposerProps) {
+  const buttonSize = compact ? "sm" : "md";
+  const [value, setValue] = useState(initialValue);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <form
+      onSubmit={async (e) => {
+        e.preventDefault();
+        if (loading || uploading || value.trim().length < 1) return;
+        setLoading(true);
+        setError(null);
+        try {
+          await onSubmit(value);
+          setValue("");
+        } catch (err) {
+          setError((err as Error).message || "Error saving comment");
+        } finally {
+          setLoading(false);
+        }
+      }}
+    >
+      {loading && <LoadingOverlay />}
+      <RichTextEditor
+        value={value}
+        onChange={setValue}
+        placeholder={placeholder}
+        size="sm"
+        height={height}
+        autoGrow={!!maxHeight}
+        maxHeight={maxHeight}
+        autoFocus={autofocus}
+        autoFocusAtEnd={autofocusAtEnd}
+        simpleToolbar
+        collapsibleToolbar
+        onUploadingChange={setUploading}
+      />
+      {/* Left aligned: the bottom-right corner belongs to the help launcher. */}
+      <Flex align="center" mt="3" gap="2">
+        {cta ? (
+          <Button
+            type="submit"
+            size={buttonSize}
+            disabled={uploading || value.trim().length < 1}
+          >
+            {cta}
+          </Button>
+        ) : null}
+        {onCancel ? (
+          <Button
+            variant="ghost"
+            color="gray"
+            size={buttonSize}
+            onClick={onCancel}
+          >
+            Cancel
+          </Button>
+        ) : null}
+        {error ? (
+          <HelperText status="error" size="sm">
+            {error}
+          </HelperText>
+        ) : null}
+      </Flex>
+    </form>
+  );
+}

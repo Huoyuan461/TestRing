@@ -1,0 +1,288 @@
+import { format } from "shared/sql";
+import {
+  CONTEXTUAL_BANDIT_EAQ_BANDIT_VERSION_COLUMN,
+  CONTEXTUAL_BANDIT_EAQ_LEAF_ID_COLUMN,
+  CONTEXTUAL_BANDIT_EAQ_VARIATION_WEIGHTS_COLUMN,
+} from "shared/validators";
+import type { ContextualBanditSrmQueryParams } from "shared/types/integrations";
+import type { SqlDialect } from "shared/types/sql";
+import { compileSqlTemplate } from "back-end/src/util/sql";
+
+const MIN_EXPECTED_PER_CELL = 5;
+const MIN_VALID_CELLS_PER_GROUP = 2;
+
+/**
+ * Sample Ratio Mismatch (SRM) for contextual bandits, computed in SQL.
+ *
+ * Each assignment-query row carries the per-row variation weights, the policy
+ * leaf (`leaf_id`), and the bandit version / weight-update generation
+ * (`bandit_version`).
+ *
+ * For every (leaf_id, bandit_version) group we compare, per variation:
+ *   - observed = number of users assigned to that variation, and
+ *   - expected = sum of that variation's per-user weights.
+ *
+ * Cells whose expected count is below MIN_EXPECTED_PER_CELL (5) are dropped and
+ * contribute to neither the statistic nor the degrees of freedom. A
+ * (leaf_id, bandit_version) group is only kept when at least
+ * MIN_VALID_CELLS_PER_GROUP (2) of its cells survive that filter.
+ *
+ */
+export function getContextualBanditSrmQuery(
+  dialect: SqlDialect,
+  params: ContextualBanditSrmQueryParams,
+): string {
+  const { settings } = params;
+
+  const exposureQuery = settings.exposureQuery;
+
+  const variations = settings.variations ?? [];
+  if (variations.length === 0) {
+    throw new Error(
+      "Contextual bandit SRM query requires at least one variation",
+    );
+  }
+
+  const userIdType = exposureQuery.identifierType;
+  const timestampColumn = "e.timestamp";
+  const startDate: Date = settings.startDate;
+  const endDate: Date | undefined = settings.endDate;
+
+  const leafCol = CONTEXTUAL_BANDIT_EAQ_LEAF_ID_COLUMN;
+  const banditVersionCol = CONTEXTUAL_BANDIT_EAQ_BANDIT_VERSION_COLUMN;
+  const weightsCol = CONTEXTUAL_BANDIT_EAQ_VARIATION_WEIGHTS_COLUMN;
+
+  const weightSelectCols = variations
+    .map((_, i) => `, ${dialect.arrayElement(`e.${weightsCol}`, i)} AS w_${i}`)
+    .join("\n          ");
+
+  const weightPassCols = variations
+    .map((_, i) => `, w_${i}`)
+    .join("\n          ");
+
+  const { variationKeys } = params;
+  const cellAggCols = variations
+    .map((v, i) => {
+      // warehouse key (e.g., "variation_2") to positional index (e.g., 2)
+      const key = variationKeys[v.id];
+      if (key === undefined) {
+        throw new Error(
+          `Contextual bandit SRM query is missing the warehouse key for variation "${v.id}"`,
+        );
+      }
+      return `, SUM(${dialect.ifElse(
+        `variation = '${dialect.escapeStringLiteral(key)}'`,
+        "1",
+        "0",
+      )}) AS observed_${i}\n          , SUM(w_${i}) AS expected_${i}`;
+    })
+    .join("\n          ");
+
+  const cellRows = variations
+    .map(
+      (_, i) =>
+        `SELECT leaf_id, bandit_version, observed_${i} AS observed, expected_${i} AS expected FROM __cbCellAgg`,
+    )
+    .join("\n        UNION ALL\n        ");
+
+  // Per (leaf_id, variation) observed/expected for the most recent bandit period
+  // only.
+  const latestBreakdownRows = variations
+    .map(
+      (_, i) =>
+        `SELECT
+          a.leaf_id AS leaf_id
+          , a.bandit_version AS bandit_version
+          , ${dialect.castToString(`'${i}'`)} AS variation
+          , a.observed_${i} AS observed
+          , a.expected_${i} AS expected
+        FROM __cbCellAgg a
+        JOIN __cbLatestVersion v ON (a.bandit_version = v.bandit_version)`,
+    )
+    .join("\n        UNION ALL\n        ");
+
+  return format(
+    `-- Contextual Bandit SRM
+    WITH
+      __rawExperiment AS (
+        ${compileSqlTemplate(
+          exposureQuery.query,
+          {
+            startDate,
+            endDate,
+            experimentId: settings.experimentId,
+            phase: settings.phase,
+            customFields: settings.customFields,
+          },
+          dialect,
+        )}
+      )
+      , __cbExposures AS (
+        SELECT
+          e.${userIdType} AS uid
+          , e.${leafCol} AS leaf_id
+          , e.${banditVersionCol} AS bandit_version
+          , ${dialect.castToString("e.variation_id")} AS variation
+          , ${timestampColumn} AS timestamp
+          ${weightSelectCols}
+        FROM
+          __rawExperiment e
+        WHERE
+          e.experiment_id = '${settings.experimentId}'
+          AND ${timestampColumn} >= ${dialect.toTimestamp(startDate)}
+          ${
+            endDate
+              ? `AND ${timestampColumn} <= ${dialect.toTimestamp(endDate)}`
+              : ""
+          }
+          ${settings.queryFilter ? `AND (\n${settings.queryFilter}\n)` : ""}
+      )
+      , __cbRankedExposures AS (
+        SELECT
+          uid
+          , leaf_id
+          , bandit_version
+          , variation
+          , timestamp
+          ${weightPassCols}
+          , ROW_NUMBER() OVER (
+              PARTITION BY uid, leaf_id, bandit_version
+              ORDER BY timestamp ASC
+            ) AS __rn
+          , MIN(variation) OVER (
+              PARTITION BY uid, leaf_id, bandit_version
+            ) AS __min_variation
+          , MAX(variation) OVER (
+              PARTITION BY uid, leaf_id, bandit_version
+            ) AS __max_variation
+        FROM
+          __cbExposures
+      )
+      , __cbUnits AS (
+        -- Keep each user's first exposure within the cell, but separate out
+        -- multiple-exposure users.
+        SELECT
+          uid
+          , leaf_id
+          , bandit_version
+          , variation
+          , timestamp
+          ${weightPassCols}
+        FROM
+          __cbRankedExposures
+        WHERE
+          __rn = 1
+          AND __min_variation = __max_variation
+      )
+      , __cbCellAgg AS (
+        SELECT
+          leaf_id
+          , bandit_version
+          , MAX(timestamp) AS latest_ts
+          ${cellAggCols}
+        FROM
+          __cbUnits
+        GROUP BY
+          leaf_id
+          , bandit_version
+      )
+      , __cbCells AS (
+        ${cellRows}
+      )
+      , __cbValidCells AS (
+        -- Drop cells without enough expected data to be usable in the test.
+        SELECT
+          leaf_id
+          , bandit_version
+          , observed
+          , expected
+        FROM
+          __cbCells
+        WHERE
+          expected >= ${MIN_EXPECTED_PER_CELL}
+      )
+      , __cbGroups AS (
+        -- Per (leaf_id, bandit_version): count usable cells and accumulate
+        -- their chi-square contribution. Keep only groups with at least 2 cells.
+        SELECT
+          leaf_id
+          , bandit_version
+          , COUNT(*) AS num_valid_cells
+          , SUM(POW(observed - expected, 2) / expected) AS group_statistic
+        FROM
+          __cbValidCells
+        GROUP BY
+          leaf_id
+          , bandit_version
+        HAVING
+          COUNT(*) >= ${MIN_VALID_CELLS_PER_GROUP}
+      )
+      , __cbResult AS (
+        -- Statistic summed across kept groups, plus degrees of freedom computed
+        -- as (sum of usable cells across kept groups) - (number of kept groups).
+        SELECT
+          COALESCE(SUM(group_statistic), 0) AS statistic
+          , COALESCE(SUM(num_valid_cells), 0) - COUNT(*) AS degrees_of_freedom
+        FROM
+          __cbGroups
+      )
+      , __cbMultipleExposures AS (
+        -- Distinct users who saw more than one variation within a single
+        -- (leaf_id, bandit_version) cell.
+        SELECT
+          COUNT(DISTINCT uid) AS multiple_exposures
+        FROM
+          __cbRankedExposures
+        WHERE
+          __min_variation <> __max_variation
+      )
+      , __cbLatestVersion AS (
+        -- Most recent bandit period (weight-update generation).
+        SELECT bandit_version
+        FROM (
+          SELECT
+            bandit_version
+            , ROW_NUMBER() OVER (ORDER BY MAX(latest_ts) DESC) AS __vrn
+          FROM __cbCellAgg
+          GROUP BY bandit_version
+        ) __cbVersionRank
+        WHERE __vrn = 1
+      )
+      , __cbLatestBreakdown AS (
+        ${latestBreakdownRows}
+      )
+    -- Row 0 (row_type='summary') carries the overall statistic + degrees of
+    -- freedom (across ALL periods) and the multiple-exposure user count. The
+    -- remaining rows (row_type='cell') are the raw observed/expected per leaf &
+    -- variation for the latest period only, so they will NOT reconcile to the
+    -- statistic.
+    SELECT
+      ${dialect.castToString("'summary'")} AS row_type
+      , statistic AS statistic
+      , degrees_of_freedom AS degrees_of_freedom
+      , ${dialect.castToString("''")} AS bandit_version
+      , ${dialect.castToString("''")} AS leaf_id
+      , ${dialect.castToString("''")} AS variation
+      , 0 AS observed
+      , 0 AS expected
+      , m.multiple_exposures AS multiple_exposures
+    FROM
+      __cbResult
+      CROSS JOIN __cbMultipleExposures m
+    UNION ALL
+    SELECT
+      ${dialect.castToString("'cell'")} AS row_type
+      , 0 AS statistic
+      , 0 AS degrees_of_freedom
+      , ${dialect.castToString("bandit_version")} AS bandit_version
+      , ${dialect.castToString("leaf_id")} AS leaf_id
+      , variation AS variation
+      , observed AS observed
+      , expected AS expected
+      , 0 AS multiple_exposures
+    FROM
+      __cbLatestBreakdown
+    `,
+    dialect.formatDialect,
+  );
+}

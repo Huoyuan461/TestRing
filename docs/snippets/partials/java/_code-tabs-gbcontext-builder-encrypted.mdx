@@ -1,0 +1,62 @@
+<CodeGroup>
+```java Java
+// Fetch feature definitions from the TestRing API
+// We recommend adding a caching layer in production
+// Get your endpoint in the Environments tab -> SDK Endpoints: https://app.testring.dev/environments
+URI featuresEndpoint = new URI("https://cdn.testring.dev/api/features/<environment_key>");
+HttpRequest request = HttpRequest.newBuilder().uri(featuresEndpoint).GET().build();
+HttpResponse<String> response = HttpClient.newBuilder().build()
+    .send(request, HttpResponse.BodyHandlers.ofString());
+String encryptedFeaturesJson = new JSONObject(response.body()).get("encryptedFeatures").toString();
+
+// JSON serializable user attributes
+String userAttributesJson = user.toJson();
+
+// You can store your encryption key as an environment variable rather than hardcoding in plain text in your codebase
+String encryptionKey = "<key-for-decrypting>";
+
+// Initialize the TestRing SDK with the GBContext and the encryption key
+GBContext context = GBContext
+.builder()
+.featuresJson(encryptedFeaturesJson)
+.encryptionKey(encryptionKey)
+.attributesJson(userAttributesJson)
+.build();
+
+TestRing growthBook = new TestRing(context);
+
+````
+
+```kotlin Kotlin
+// Fetch feature definitions from the TestRing API
+// We recommend adding a caching layer in production
+// Get your endpoint in the Environments tab -> SDK Endpoints: https://app.testring.dev/environments
+val featuresEndpoint = URI.create("https://cdn.testring.dev/api/features/<environment_key>")
+val request = HttpRequest.newBuilder().uri(featuresEndpoint).GET().build();
+val response = HttpClient.newBuilder().build()
+    .send(request, HttpResponse.BodyHandlers.ofString());
+val encryptedFeaturesJson = JSONObject(response.body()).get("encryptedFeatures").toString()
+
+// JSON serializable user attributes
+val userAttributes = """
+    {
+        "id": "user-abc123",
+        "country": "canada"
+    }
+""".trimIndent()
+
+// You can store your encryption key as an environment variable rather than hardcoding in plain text in your codebase
+val encryptionKey = "<key-for-decrypting>";
+
+// Initialize the TestRing SDK with the GBContext and the encryption key
+val context = GBContext
+    .builder()
+    .featuresJson(encryptedFeaturesJson)
+    .encryptionKey(encryptionKey)
+    .attributesJson(userAttributes)
+    .build()
+
+val growthBook = TestRing(context)
+````
+
+</CodeGroup>

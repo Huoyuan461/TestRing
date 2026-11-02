@@ -1,0 +1,319 @@
+import * as React from "react";
+import { render, renderHook } from "@testing-library/react";
+import {
+  FeatureRevisionDiffInput,
+  legacyEnvironmentRefs,
+  useFeatureRevisionDiff,
+} from "@/hooks/useFeatureRevisionDiff";
+
+describe("useFeatureRevisionDiff", () => {
+  it("produces a single rule-centric diff (not bucketed by env) when one rule is modified", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "rule1",
+          description: "test",
+          type: "force",
+          value: "true",
+          allEnvironments: false,
+          environments: ["production"],
+        },
+        {
+          id: "rule2",
+          description: "test",
+          type: "force",
+          value: "false",
+          allEnvironments: false,
+          environments: ["staging"],
+        },
+      ],
+    };
+
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "rule1",
+          description: "test",
+          type: "force",
+          value: "changed",
+          allEnvironments: false,
+          environments: ["production"],
+        },
+        {
+          id: "rule2",
+          description: "test",
+          type: "force",
+          value: "false",
+          allEnvironments: false,
+          environments: ["staging"],
+        },
+      ],
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    // One flat "Rules" section, no per-env splitting, no env suffix.
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0].title).toBe("Rules");
+    // Badges should be env-agnostic ("Edit rule", not "Edit rule in production").
+    const editBadge = result.current[0].badges?.find((b) =>
+      b.label.startsWith("Edit rule"),
+    );
+    expect(editBadge?.label).toBe("Edit rule");
+  });
+
+  it("emits a Rules diff for allEnvironments rule changes (pre-fix gap)", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "rule1",
+          description: "test",
+          type: "force",
+          value: "true",
+          allEnvironments: true,
+        },
+      ],
+      environmentsEnabled: { production: true, staging: true },
+    };
+
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "rule1",
+          description: "test",
+          type: "force",
+          value: "updated",
+          allEnvironments: true,
+        },
+      ],
+      environmentsEnabled: { production: true, staging: true },
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0].title).toBe("Rules");
+  });
+
+  it("emits a Rules diff for pending (environments:[]) rule changes (pre-fix gap)", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+    };
+
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "pendingRule",
+          description: "staged but not yet targeted",
+          type: "force",
+          value: "true",
+          allEnvironments: false,
+          environments: [],
+        },
+      ],
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0].title).toBe("Rules");
+    const addBadge = result.current[0].badges?.find(
+      (b) => b.action === "add rule",
+    );
+    expect(addBadge?.label).toBe("Add rule");
+  });
+
+  // Regression: missing keys in `environmentsEnabled` on the older revision
+  // used to flip to `enabled: true` via an "infer the opposite" fallback,
+  // producing phantom `enabled → disabled` toggle diffs.
+  it("does not emit phantom env-toggle diffs when older revision lacks keys", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+      environmentsEnabled: { production: false },
+    };
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+      environmentsEnabled: {
+        production: false,
+        staging: false,
+        dev: false,
+      },
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    const toggleDiffs = result.current.filter((d) =>
+      d.title.startsWith("Environment"),
+    );
+    expect(toggleDiffs).toHaveLength(0);
+  });
+
+  // Regression: scope changes used to render as raw `allEnvironments` /
+  // JSON env-arrays via the generic fallback. The combined row uses the
+  // same badge style as rule headings and only shows active envs.
+  it("renders a combined Environments row with badges, not raw allEnvironments/environments", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "r1",
+          description: "",
+          type: "force",
+          value: "true",
+          allEnvironments: true,
+        },
+      ],
+    };
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [
+        {
+          id: "r1",
+          description: "",
+          type: "force",
+          value: "true",
+          allEnvironments: false,
+          environments: ["production", "dev"],
+        },
+      ],
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+    const rulesDiff = result.current.find((d) => d.title === "Rules");
+    expect(rulesDiff).toBeDefined();
+    const { container } = render(rulesDiff!.customRender as React.ReactElement);
+    const html = container.innerHTML;
+
+    expect(html).toContain("Environments");
+    expect(html).toContain("All environments");
+    expect(html).toContain("production");
+    expect(html).toContain("dev");
+    expect(html).not.toContain("allEnvironments");
+    expect(html).not.toContain('["production","dev"]');
+  });
+
+  it("titles a single toggled environment in the singular", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+      environmentsEnabled: { production: false },
+    };
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+      environmentsEnabled: { production: true },
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    const toggleDiffs = result.current.filter((d) =>
+      d.title.startsWith("Environment"),
+    );
+    expect(toggleDiffs).toHaveLength(1);
+    expect(toggleDiffs[0].title).toBe("Environment");
+  });
+
+  it("ignores rule fields the rule type does not declare", () => {
+    const rule = {
+      type: "experiment-ref",
+      id: "r1",
+      description: "",
+      enabled: true,
+      allEnvironments: true,
+      condition: "",
+      scheduleRules: [],
+      experimentId: "exp_1",
+      variations: [{ variationId: "v0", value: "a" }],
+    };
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "a",
+      rules: [rule] as never,
+    };
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "a",
+      rules: [
+        { ...rule, hashVersion: 2, disableStickyBucketing: false },
+      ] as never,
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    expect(result.current.filter((d) => d.key === "rules")).toHaveLength(0);
+  });
+
+  it("groups every toggled environment into one section", () => {
+    const current: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+      environmentsEnabled: { production: false, staging: true, dev: false },
+    };
+    const draft: FeatureRevisionDiffInput = {
+      defaultValue: "false",
+      rules: [],
+      environmentsEnabled: { production: true, staging: false, dev: false },
+    };
+
+    const { result } = renderHook(() =>
+      useFeatureRevisionDiff({ current, draft }),
+    );
+
+    const toggleDiffs = result.current.filter((d) =>
+      d.title.startsWith("Environment"),
+    );
+    expect(toggleDiffs).toHaveLength(1);
+    expect(toggleDiffs[0].title).toBe("Environments");
+    expect(JSON.parse(toggleDiffs[0].a)).toEqual({
+      production: false,
+      staging: true,
+    });
+    expect(JSON.parse(toggleDiffs[0].b)).toEqual({
+      production: true,
+      staging: false,
+    });
+    expect(toggleDiffs[0].badges?.map((b) => b.label)).toEqual([
+      "Toggled production on",
+      "Toggled staging off",
+    ]);
+  });
+
+  it("points per-environment comment refs at their line in the merged section", () => {
+    const a = JSON.stringify({ production: false, staging: true }, null, 2);
+    const b = JSON.stringify({ production: true, staging: false }, null, 2);
+
+    const refs = legacyEnvironmentRefs(a, b);
+
+    expect(refs.get("environmentsEnabled.production:R1")).toEqual({
+      sectionKey: "environmentsEnabled",
+      side: "R",
+      line: 2,
+    });
+    expect(refs.get("environmentsEnabled.staging:L1")).toEqual({
+      sectionKey: "environmentsEnabled",
+      side: "L",
+      line: 3,
+    });
+    expect(refs.has("environmentsEnabled.dev:R1")).toBe(false);
+  });
+});

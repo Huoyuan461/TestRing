@@ -1,0 +1,204 @@
+import React, { forwardRef, useEffect, useRef } from "react";
+import { Table as RadixTable } from "@radix-ui/themes";
+import clsx from "clsx";
+import { useIsOverflowingX } from "@/hooks/useIsOverflowing";
+import { radixSize, Size } from "@/ui/sizes";
+import styles from "./Table.module.scss";
+
+/** Standard top offset (px) for sticky table headers. Must be >= top nav height (56px) so the header's top border isn't covered. */
+export const DEFAULT_STICKY_TOP_OFFSET_PX = 56;
+
+export type TableProps = Omit<
+  React.ComponentProps<typeof RadixTable.Root>,
+  "variant" | "size"
+> & {
+  /** "list" enables list-table wrapper, scroll, and styling; "surface" | "ghost" are passed to Radix */
+  variant?: "list" | "surface" | "ghost";
+  size?: Size<"sm" | "md" | "lg">;
+  /** When true (or when variant="list"), header row is sticky; when false, list variant keeps styling but header does not stick */
+  stickyHeader?: boolean;
+  /** Top offset in px for sticky header (default DEFAULT_STICKY_TOP_OFFSET_PX). Used as CSS var --table-sticky-top. */
+  stickyTopOffset?: number;
+  /** When true (or when variant="list"), first header row gets rounded top corners */
+  roundedCorners?: boolean;
+  /**
+   * Opt in to a bounded scroll region so wide tables scroll horizontally. The
+   * header then sticks to that region instead of the viewport — the list variant
+   * neutralises Radix's own scroll area to get viewport-sticky headers, and
+   * overflow-x can't scroll without overflow-y doing the same.
+   */
+  scrollX?: boolean;
+  /** Pins the last column to the right edge while the rest scrolls under it. */
+  stickyLastColumn?: boolean;
+  /**
+   * Height cap for the `scrollX` region, e.g. 480 or "60vh". Without it the
+   * region grows to the viewport, which pushes anything below the table (such
+   * as pagination) out of view.
+   */
+  maxHeight?: number | string;
+  /**
+   * px floor for the table itself. Under a fixed layout a column with no width
+   * takes only the leftover space, so without a floor it collapses to zero once
+   * the specified widths fill the container. `useTableColumns` computes this.
+   */
+  minTableWidth?: number;
+};
+
+export default function Table({
+  children,
+  variant,
+  size,
+  stickyHeader,
+  stickyTopOffset = DEFAULT_STICKY_TOP_OFFSET_PX,
+  roundedCorners,
+  scrollX,
+  stickyLastColumn,
+  maxHeight,
+  minTableWidth,
+  className,
+  ...props
+}: TableProps) {
+  const isListVariant =
+    variant === "list" || stickyHeader === true || roundedCorners === true;
+  const useStickyHeader =
+    (variant === "list" && stickyHeader !== false) || stickyHeader === true;
+
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  // A pinned column only earns its divider once there is something behind it.
+  const overflowX = useIsOverflowingX(
+    wrapperRef,
+    !!scrollX && !!stickyLastColumn,
+  );
+
+  useEffect(() => {
+    if (!isListVariant || !useStickyHeader) return;
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    // In a scroll region the header is always stuck to the region's top, so
+    // there is no unstuck state to detect.
+    if (scrollX) {
+      wrapper.setAttribute("data-sticky-active", "true");
+      return;
+    }
+    const header = wrapper.querySelector(".rt-TableHeader");
+    if (!header) return;
+
+    const check = () => {
+      const top = (header as HTMLElement).getBoundingClientRect().top;
+      const isSticky = Math.abs(top - stickyTopOffset) < 2;
+      if (isSticky) {
+        wrapper.setAttribute("data-sticky-active", "true");
+      } else {
+        wrapper.removeAttribute("data-sticky-active");
+      }
+    };
+
+    check();
+    window.addEventListener("scroll", check, { passive: true });
+    return () => window.removeEventListener("scroll", check);
+  }, [isListVariant, useStickyHeader, stickyTopOffset, scrollX]);
+
+  const radixVariant = variant === "list" ? "surface" : variant;
+
+  const tableElement = (
+    <RadixTable.Root
+      {...props}
+      // The list wrapper carries the floor instead, where a drag-resize moves it.
+      style={
+        !isListVariant && minTableWidth
+          ? ({
+              ...props.style,
+              "--table-min-width": `${minTableWidth}px`,
+            } as React.CSSProperties)
+          : props.style
+      }
+      variant={radixVariant}
+      size={size !== undefined ? radixSize(size) : undefined}
+      className={clsx(className, isListVariant && styles.tableList)}
+    >
+      {children}
+    </RadixTable.Root>
+  );
+
+  if (!isListVariant) {
+    return tableElement;
+  }
+
+  return (
+    <div
+      ref={wrapperRef}
+      className={styles.wrapper}
+      style={
+        {
+          ...(useStickyHeader && {
+            "--table-sticky-top": `${stickyTopOffset}px`,
+          }),
+          ...(minTableWidth && { "--table-min-width": `${minTableWidth}px` }),
+          ...(maxHeight !== undefined && {
+            "--table-max-height":
+              typeof maxHeight === "number" ? `${maxHeight}px` : maxHeight,
+          }),
+        } as React.CSSProperties
+      }
+      data-table-list
+      data-sticky-header={useStickyHeader ? "true" : "false"}
+      data-scroll-x={scrollX ? "true" : undefined}
+      data-sticky-last-column={scrollX && stickyLastColumn ? "true" : undefined}
+      data-overflow-x={overflowX ? "true" : undefined}
+    >
+      {tableElement}
+    </div>
+  );
+}
+
+export function TableHeader({
+  children,
+  ...props
+}: React.ComponentProps<typeof RadixTable.Header>) {
+  return <RadixTable.Header {...props}>{children}</RadixTable.Header>;
+}
+
+export function TableBody({
+  children,
+  ...props
+}: React.ComponentProps<typeof RadixTable.Body>) {
+  return <RadixTable.Body {...props}>{children}</RadixTable.Body>;
+}
+
+export const TableRow = forwardRef<
+  HTMLTableRowElement,
+  React.ComponentProps<typeof RadixTable.Row>
+>(function TableRow({ children, ...props }, ref) {
+  return (
+    <RadixTable.Row ref={ref} {...props}>
+      {children}
+    </RadixTable.Row>
+  );
+});
+
+export function TableRowHeaderCell({
+  children,
+  ...props
+}: React.ComponentProps<typeof RadixTable.RowHeaderCell>) {
+  return (
+    <RadixTable.RowHeaderCell {...props}>{children}</RadixTable.RowHeaderCell>
+  );
+}
+
+export function TableColumnHeader({
+  children,
+  ...props
+}: React.ComponentProps<typeof RadixTable.ColumnHeaderCell>) {
+  return (
+    <RadixTable.ColumnHeaderCell {...props}>
+      {children}
+    </RadixTable.ColumnHeaderCell>
+  );
+}
+
+export function TableCell({
+  children,
+  ...props
+}: React.ComponentProps<typeof RadixTable.Cell>) {
+  return <RadixTable.Cell {...props}>{children}</RadixTable.Cell>;
+}

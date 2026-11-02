@@ -1,0 +1,2815 @@
+/**
+ * Exhaustive SDK payload generation test suite.
+ * Single source of truth: a fixed list of connection presets (capabilities from
+ * JS SDK versions + legacy, optional flags true/false/undefined, project scoping)
+ * with every behavior from the original tests asserted per connection.
+ */
+import cloneDeep from "lodash/cloneDeep";
+import { FeatureInterface, FeatureRule } from "shared/types/feature";
+import { FeatureRevisionInterface } from "shared/types/feature-revision";
+import { ExperimentInterface } from "shared/types/experiment";
+import { ContextualBanditInterface, HoldoutInterface } from "shared/validators";
+import { GroupMap, SavedGroupInterface } from "shared/types/saved-group";
+import { SafeRolloutInterface } from "shared/types/safe-rollout";
+import {
+  OrganizationInterface,
+  SDKAttributeSchema,
+} from "shared/types/organization";
+import { FeatureDefinition } from "shared/types/sdk";
+import { ConditionInterface } from "@growthbook/growthbook";
+import {
+  getSDKCapabilities,
+  savedGroupFormatFromConnection,
+} from "shared/sdk-versioning";
+import { SavedGroupFormat } from "shared/types/sdk-connection";
+import { ApiReqContext } from "back-end/types/api";
+import {
+  hashStrings,
+  buildSDKPayloadForConnection,
+  getFeatureDefinitionsResponse,
+  applySavedGroupHashing,
+  getUsedSavedGroupIds,
+  getApiFeatureObj,
+  generateHoldoutsPayload,
+  type SDKPayloadRawData,
+  type ConnectionPayloadOptions,
+} from "back-end/src/services/features";
+import { getFeatureDefinition } from "back-end/src/util/features";
+
+jest.mock("back-end/src/models/VisualChangesetModel", () => ({
+  getAllCbVisualExperiments: jest.fn().mockResolvedValue([]),
+  getContextualBanditsWithVisualChangesets: jest.fn().mockResolvedValue([]),
+}));
+
+function minimalContext(
+  orgOverrides?: Partial<OrganizationInterface>,
+): ApiReqContext {
+  return {
+    org: {
+      id: "org-1",
+      name: "Test",
+      url: "",
+      dateCreated: new Date(),
+      ownerEmail: "",
+      members: [],
+      invites: [],
+      ...orgOverrides,
+    },
+    models: {} as ApiReqContext["models"],
+    userId: "u1",
+    email: "e@e.com",
+    userName: "User",
+    initModels: () => {},
+  } as ApiReqContext;
+}
+
+function minimalRawData(
+  overrides?: Partial<SDKPayloadRawData>,
+): SDKPayloadRawData {
+  return {
+    features: [],
+    experimentMap: new Map(),
+    groupMap: new Map(),
+    safeRolloutMap: new Map(),
+    savedGroups: [],
+    holdoutsMap: new Map(),
+    visualExperiments: [],
+    urlRedirectExperiments: [],
+    ...overrides,
+  };
+}
+
+// Unique fingerprints for f1 so rule detection is deterministic (no ambiguous structural match).
+const EXP1_FINGERPRINT = 0.31337;
+const F1_FINGERPRINT = "This is our rollout rule";
+
+// Canonical data: f1 (p1) has experiment-ref rule + force rule with $inGroup; f2 (p2); exp1; saved group sg1
+function basicMatrixData(): SDKPayloadRawData {
+  const exp: ExperimentInterface = {
+    id: "exp1",
+    organization: "org-1",
+    project: "p1",
+    name: "Matrix Exp",
+    hypothesis: "",
+    status: "running",
+    hashVersion: 2,
+    phases: [
+      {
+        phase: "main",
+        coverage: 1,
+        variationWeights: [EXP1_FINGERPRINT, 1 - EXP1_FINGERPRINT],
+        seed: "matrix-exp-seed",
+      },
+    ],
+    variations: [
+      { id: "v0", key: "0", name: "Control" },
+      { id: "v1", key: "1", name: "Treatment" },
+    ],
+    dateCreated: new Date(),
+    dateUpdated: new Date(),
+    trackingKey: "tk",
+    archived: false,
+    hasVisualChangesets: true, // required so includeExperimentInPayload(exp) is true and experiment-ref rule is included
+  } as ExperimentInterface;
+  const f1: FeatureInterface = {
+    id: "f1",
+    project: "p1",
+    dateCreated: new Date(),
+    dateUpdated: new Date(),
+    defaultValue: true,
+    organization: "org-1",
+    owner: "",
+    valueType: "boolean",
+    archived: false,
+    description: "",
+    version: 1,
+    environmentSettings: {
+      production: {
+        enabled: true,
+        rules: [
+          {
+            type: "experiment-ref",
+            id: "rule-matrix",
+            enabled: true,
+            experimentId: "exp1",
+            variations: [
+              { variationId: "v0", value: "v0", key: "0", name: "Control" },
+              { variationId: "v1", value: "v1", key: "1", name: "Treatment" },
+            ],
+          },
+          {
+            type: "force",
+            id: "r1",
+            enabled: true,
+            value: false,
+            condition: `{"browser":"${F1_FINGERPRINT}","id":{"$inGroup":"sg1"}}`,
+          },
+        ],
+      },
+    },
+  } as FeatureInterface;
+  const f2: FeatureInterface = {
+    ...cloneDeep(f1),
+    id: "f2",
+    project: "p2",
+    environmentSettings: {
+      production: { enabled: true, rules: [] },
+    },
+  } as FeatureInterface;
+  const sg1: SavedGroupInterface = {
+    id: "sg1",
+    organization: "org-1",
+    groupName: "G1",
+    type: "list",
+    values: ["a", "b"],
+    attributeKey: "id",
+  } as SavedGroupInterface;
+  const groupMap: GroupMap = new Map([
+    [
+      "sg1",
+      {
+        id: "sg1",
+        type: "list",
+        attributeKey: "id",
+        useEmptyListGroup: false,
+        values: ["a", "b"],
+      },
+    ],
+  ]);
+  return minimalRawData({
+    features: [f1, f2],
+    experimentMap: new Map([["exp1", exp]]),
+    savedGroups: [sg1],
+    groupMap,
+  });
+}
+
+// Connection presets: capabilities from JS SDK versions (everything = undefined = default/latest) + legacy; optional flags true/false/undefined; projects null | [] | ["p1"]
+const ENCRYPTION_KEY = "test-key-32-bytes-long!!!!!!!!";
+
+const CONNECTION_PRESETS: Array<{
+  name: string;
+  connection: ConnectionPayloadOptions;
+}> = [];
+
+// Capability sets from javascript.json: everything (undefined), 0.0.0, 0.23.0, 0.34.0, 1.1.0, 0.36.0, 1.6.5, 1.7.0, legacy
+const CAPABILITY_SETS: Array<{ label: string; capabilities: string[] }> = [
+  {
+    label: "javascript default (everything)",
+    capabilities: getSDKCapabilities("javascript"),
+  },
+  {
+    label: "javascript 0.0.0 (looseUnmarshalling)",
+    capabilities: getSDKCapabilities("javascript", "0.0.0"),
+  },
+  {
+    label: "javascript 0.23.0 (+ bucketingV2)",
+    capabilities: getSDKCapabilities("javascript", "0.23.0"),
+  },
+  {
+    label: "javascript 0.34.0 (+ prerequisites)",
+    capabilities: getSDKCapabilities("javascript", "0.34.0"),
+  },
+  {
+    label: "javascript 1.1.0 (+ savedGroupReferences)",
+    capabilities: getSDKCapabilities("javascript", "1.1.0"),
+  },
+  {
+    label: "javascript 0.36.0 (+ redirects)",
+    capabilities: getSDKCapabilities("javascript", "0.36.0"),
+  },
+  {
+    label: "javascript 1.6.5",
+    capabilities: getSDKCapabilities("javascript", "1.6.5"),
+  },
+  {
+    label: "javascript 1.7.0 (+ contextualBandits)",
+    capabilities: getSDKCapabilities("javascript", "1.7.0"),
+  },
+  { label: "legacy API key (bucketingV2 only)", capabilities: ["bucketingV2"] },
+];
+
+for (const { label, capabilities } of CAPABILITY_SETS) {
+  CONNECTION_PRESETS.push({
+    name: `${label}, projects [], optional flags false`,
+    connection: {
+      capabilities: capabilities as ConnectionPayloadOptions["capabilities"],
+      environment: "production",
+      projects: [],
+      encryptPayload: false,
+      encryptionKey: "",
+      includeVisualExperiments: false,
+      includeDraftExperiments: false,
+      includeExperimentNames: false,
+      includeRedirectExperiments: false,
+      includeRuleIds: false,
+      hashSecureAttributes: false,
+      savedGroupFormat: "inline",
+    },
+  });
+  CONNECTION_PRESETS.push({
+    name: `${label}, projects null (empty payload)`,
+    connection: {
+      capabilities: capabilities as ConnectionPayloadOptions["capabilities"],
+      environment: "production",
+      projects: null,
+    },
+  });
+  CONNECTION_PRESETS.push({
+    name: `${label}, projects ["p1"], includeRuleIds true, includeExperimentNames true`,
+    connection: {
+      capabilities: capabilities as ConnectionPayloadOptions["capabilities"],
+      environment: "production",
+      projects: ["p1"],
+      encryptPayload: false,
+      includeRuleIds: true,
+      includeExperimentNames: true,
+      includeVisualExperiments: false,
+      includeDraftExperiments: false,
+      includeRedirectExperiments: false,
+      savedGroupFormat: capabilities.includes("savedGroupReferences")
+        ? "referencesV1"
+        : "inline",
+    },
+  });
+}
+
+// Optional flags: true / false / undefined (omitted) – add a few more presets for full coverage
+CONNECTION_PRESETS.push({
+  name: "bucketingV2, encryptPayload true, encryptionKey set",
+  connection: {
+    capabilities: ["bucketingV2"],
+    environment: "production",
+    projects: [],
+    encryptPayload: true,
+    encryptionKey: ENCRYPTION_KEY,
+    includeRuleIds: false,
+    includeExperimentNames: false,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "savedGroupReferences + savedGroupFormat referencesV1",
+  connection: {
+    capabilities: ["savedGroupReferences", "bucketingV2"],
+    environment: "production",
+    projects: ["p1"],
+    savedGroupFormat: "referencesV2",
+    includeRuleIds: false,
+    includeExperimentNames: false,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "savedGroupReferencesV2 + savedGroupFormat referencesV2",
+  connection: {
+    capabilities: [
+      "savedGroupReferences",
+      "savedGroupReferencesV2",
+      "bucketingV2",
+    ],
+    environment: "production",
+    projects: ["p1"],
+    savedGroupFormat: "referencesV2",
+    includeRuleIds: false,
+    includeExperimentNames: false,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "savedGroupReferences + savedGroupFormat inline (expand $inGroup)",
+  connection: {
+    capabilities: ["looseUnmarshalling", "bucketingV2"],
+    environment: "production",
+    projects: ["p1"],
+    savedGroupFormat: "inline",
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "hashSecureAttributes true",
+  connection: {
+    capabilities: ["bucketingV2"],
+    environment: "production",
+    projects: [],
+    hashSecureAttributes: true,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "hashSecureAttributes false",
+  connection: {
+    capabilities: ["bucketingV2"],
+    environment: "production",
+    projects: [],
+    hashSecureAttributes: false,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "includeVisualExperiments true",
+  connection: {
+    capabilities: ["bucketingV2"],
+    environment: "production",
+    projects: [],
+    includeVisualExperiments: true,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "includeDraftExperiments true",
+  connection: {
+    capabilities: ["bucketingV2"],
+    environment: "production",
+    projects: [],
+    includeDraftExperiments: true,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "includeDraftExperiments false",
+  connection: {
+    capabilities: ["bucketingV2"],
+    environment: "production",
+    projects: [],
+    includeDraftExperiments: false,
+  },
+});
+
+CONNECTION_PRESETS.push({
+  name: "includeRedirectExperiments true with redirects capability",
+  connection: {
+    capabilities: ["bucketingV2", "redirects"],
+    environment: "production",
+    projects: [],
+    includeRedirectExperiments: true,
+  },
+});
+
+describe("SDK payload generation (exhaustive connection matrix)", () => {
+  it.each(CONNECTION_PRESETS)(
+    "builds valid payload and asserts shape/rule/savedGroup: $name",
+    async ({ connection }) => {
+      const ctx = minimalContext();
+      const data = basicMatrixData();
+      const out = await buildSDKPayloadForConnection({
+        context: ctx,
+        connection,
+        data,
+      });
+
+      expect(out.dateUpdated).toBeInstanceOf(Date);
+
+      if (connection.projects === null) {
+        expect(out.features).toEqual({});
+        expect(out.experiments).toEqual([]);
+        return;
+      }
+
+      if (connection.encryptPayload && connection.encryptionKey) {
+        expect(out.encryptedFeatures).toBeDefined();
+        expect(Object.keys(out.features)).toHaveLength(0);
+        return;
+      }
+
+      const hasBucketingV2 = connection.capabilities.includes("bucketingV2");
+      // When looseUnmarshalling is present, payload generation does not strip keys (allowedKeys = null), so we get full rule shape.
+      const hasFullRuleShape =
+        hasBucketingV2 ||
+        connection.capabilities.includes("looseUnmarshalling");
+      const hasSavedGroupRefs =
+        connection.capabilities.includes("savedGroupReferences") &&
+        connection.savedGroupFormat !== undefined &&
+        connection.savedGroupFormat !== "inline";
+
+      if (
+        connection.projects &&
+        connection.projects.length > 0 &&
+        connection.projects[0] === "p1"
+      ) {
+        expect(Object.keys(out.features)).toContain("f1");
+        expect(Object.keys(out.features)).not.toContain("f2");
+      } else {
+        expect(Object.keys(out.features)).toContain("f1");
+        expect(Object.keys(out.features)).toContain("f2");
+      }
+
+      const f1Def = out.features.f1;
+      if (!f1Def?.rules?.length) return;
+
+      const rules = f1Def.rules as Record<string, unknown>[];
+      // Deterministic lookup: by id when present, else by unique fingerprint only (so holdout/other rules cannot be mistaken).
+      const expRefRule = rules.find(
+        (r) =>
+          r.id === "rule-matrix" ||
+          (Array.isArray(r.weights) && r.weights[0] === EXP1_FINGERPRINT),
+      );
+      const forceRule = rules.find(
+        (r) =>
+          r.id === "r1" ||
+          // The fingerprint is unique, and v2 nests the browser check inside
+          // an $and, so match anywhere in the condition
+          JSON.stringify(r.condition ?? null).includes(F1_FINGERPRINT),
+      );
+
+      if (!expRefRule) {
+        throw new Error(
+          `Canonical data has one experiment-ref rule; payload should include it. Got ${rules.length} rule(s): ${JSON.stringify(rules.map((r) => Object.keys(r)))}`,
+        );
+      }
+      if (!forceRule) {
+        throw new Error(
+          `Canonical data has one force rule ($inGroup sg1); payload should include it. Got ${rules.length} rule(s): ${JSON.stringify(rules.map((r) => Object.keys(r)))}`,
+        );
+      }
+
+      {
+        if (hasFullRuleShape) {
+          expect(expRefRule).toHaveProperty("hashVersion");
+          expect(expRefRule).toHaveProperty("seed");
+          expect(expRefRule).toHaveProperty("meta");
+          expect(expRefRule).toHaveProperty("phase");
+        } else {
+          expect(expRefRule).toHaveProperty("hashAttribute");
+          expect(expRefRule).toHaveProperty("namespace");
+          expect(expRefRule).not.toHaveProperty("hashVersion");
+          expect(expRefRule).not.toHaveProperty("seed");
+          expect(expRefRule).not.toHaveProperty("meta");
+          expect(expRefRule).not.toHaveProperty("name");
+        }
+
+        if (connection.includeRuleIds === true) {
+          expect(expRefRule.id).toBe("rule-matrix");
+        }
+        if (connection.includeExperimentNames === true && hasFullRuleShape) {
+          expect(expRefRule.name).toBe("Matrix Exp");
+        }
+        if (
+          connection.includeRuleIds === false ||
+          connection.includeExperimentNames === false
+        ) {
+          if (connection.includeRuleIds === false)
+            expect(expRefRule.id).toBeUndefined();
+          if (connection.includeExperimentNames === false)
+            expect(expRefRule.name).toBeUndefined();
+        }
+      }
+
+      const cond = forceRule.condition as Record<string, unknown>;
+      if (
+        hasSavedGroupRefs &&
+        connection.capabilities.includes("savedGroupReferencesV2")
+      ) {
+        // The rule is stored with $inGroup, which v2 rewrites
+        expect(cond).not.toHaveProperty("id");
+        expect(cond.$and).toEqual([
+          { browser: F1_FINGERPRINT },
+          { $savedGroup: { id: "sg1" } },
+        ]);
+        expect(JSON.stringify(out.features)).not.toContain("$inGroup");
+        expect(out.savedGroups?.sg1).toEqual({
+          type: "list",
+          attributeKey: "id",
+          values: ["a", "b"],
+        });
+      } else if (hasSavedGroupRefs) {
+        expect(cond).toHaveProperty("id");
+        expect((cond.id as Record<string, unknown>).$inGroup).toBe("sg1");
+        expect(out.savedGroups).toHaveProperty("sg1");
+      } else {
+        expect(cond).toHaveProperty("id");
+        expect((cond.id as Record<string, unknown>).$in).toEqual(["a", "b"]);
+      }
+    },
+  );
+});
+
+describe("SDK payload generation (scenario-specific)", () => {
+  it("holdout definitions merged when prerequisites capability", async () => {
+    const ctx = minimalContext();
+    const holdout: HoldoutInterface = {
+      id: "holdout-1",
+      organization: "org-1",
+      name: "H1",
+      description: "",
+      environment: "production",
+      projects: [],
+      experimentId: "exp1",
+      holdoutPercent: 0.1,
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      environmentSettings: {
+        production: { enabled: true, rules: [] },
+      },
+    } as HoldoutInterface;
+    const holdoutExperiment: ExperimentInterface = {
+      id: "exp1",
+      organization: "org-1",
+      project: "",
+      name: "Holdout Exp",
+      hypothesis: "",
+      status: "running",
+      phases: [{ phase: "main", coverage: 0.9, variationWeights: [0.5, 0.5] }],
+      variations: [
+        { id: "v0", key: "0", name: "C" },
+        { id: "v1", key: "1", name: "T" },
+      ],
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      trackingKey: "tk",
+      archived: false,
+    } as ExperimentInterface;
+    const holdoutsMap = new Map([
+      [
+        "holdout-1",
+        { holdout, holdoutExperiment /* renamed from `experiment` on main */ },
+      ],
+    ]);
+    const featureRefHoldout: FeatureInterface = {
+      id: "f1",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      defaultValue: true,
+      organization: "org-1",
+      owner: "",
+      valueType: "boolean",
+      archived: false,
+      description: "",
+      version: 1,
+      environmentSettings: {
+        production: {
+          enabled: true,
+          rules: [
+            {
+              type: "experiment",
+              id: "r1",
+              enabled: true,
+              coverage: 1,
+              values: [
+                { value: "v0", weight: 0.5, name: "C" },
+                { value: "v1", weight: 0.5, name: "T" },
+              ],
+              hashAttribute: "id",
+              seed: "s1",
+              namespace: { enabled: true, name: "ns", range: [0, 1] },
+            },
+          ],
+        },
+      },
+    } as FeatureInterface;
+    const connection: ConnectionPayloadOptions = {
+      capabilities: ["bucketingV2", "prerequisites"],
+      environment: "production",
+      projects: [],
+    };
+    const data = minimalRawData({
+      features: [featureRefHoldout],
+      holdoutsMap,
+      experimentMap: new Map([["exp1", holdoutExperiment]]),
+    });
+    const out = await buildSDKPayloadForConnection({
+      context: ctx,
+      connection,
+      data,
+    });
+    expect(out.features.f1).toBeDefined();
+    expect(out.features.f1?.rules?.length).toBeGreaterThanOrEqual(1);
+    expect(out.dateUpdated).toBeDefined();
+  });
+
+  it("prerequisites capability includes parentConditions; without strips them", () => {
+    const feature: FeatureInterface = {
+      id: "child",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      defaultValue: true,
+      organization: "org-1",
+      owner: "",
+      valueType: "boolean",
+      archived: false,
+      description: "",
+      version: 1,
+      prerequisites: [{ id: "parent", condition: '{"value": true}' }],
+      environmentSettings: {
+        production: {
+          enabled: true,
+          rules: [
+            {
+              type: "experiment",
+              id: "r1",
+              enabled: true,
+              coverage: 1,
+              values: [
+                { value: "v0", weight: 0.5, name: "C" },
+                { value: "v1", weight: 0.5, name: "T" },
+              ],
+              hashAttribute: "id",
+              seed: "s1",
+              namespace: { enabled: true, name: "ns", range: [0, 1] },
+              parentConditions: [
+                { id: "parent", condition: '{"value": true}' },
+              ],
+            },
+          ],
+        },
+      },
+    } as FeatureInterface;
+    const withPrereqs = getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      capabilities: ["prerequisites", "bucketingV2"],
+      includeRuleIds: true,
+      includeExperimentNames: false,
+    });
+    expect(withPrereqs.rules?.[0]).toHaveProperty("parentConditions");
+
+    const withoutPrereqs = getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      capabilities: ["bucketingV2"],
+      includeRuleIds: false,
+      includeExperimentNames: false,
+    });
+    // Feature has top-level + rule-level gates; excluded entirely when connection lacks prerequisites.
+    expect(withoutPrereqs).toBeNull();
+  });
+
+  it("includeRuleIds controls holdout rule id", () => {
+    const holdout: HoldoutInterface = {
+      id: "holdout-1",
+      organization: "org-1",
+      name: "H1",
+      description: "",
+      environment: "production",
+      projects: [],
+      experimentId: "exp1",
+      holdoutPercent: 0.1,
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      environmentSettings: {
+        production: { enabled: true, rules: [] },
+      },
+    } as HoldoutInterface;
+    const holdoutExperiment: ExperimentInterface = {
+      id: "exp1",
+      organization: "org-1",
+      project: "",
+      name: "Holdout Exp",
+      hypothesis: "",
+      status: "running",
+      phases: [{ phase: "main", coverage: 0.9, variationWeights: [0.5, 0.5] }],
+      variations: [
+        { id: "v0", key: "0", name: "C" },
+        { id: "v1", key: "1", name: "T" },
+      ],
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      trackingKey: "tk",
+      archived: false,
+    } as ExperimentInterface;
+    const holdoutsMap = new Map([
+      [
+        "holdout-1",
+        { holdout, holdoutExperiment /* renamed from `experiment` on main */ },
+      ],
+    ]);
+    const featureWithHoldout: FeatureInterface = {
+      id: "f1",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      defaultValue: true,
+      organization: "org-1",
+      owner: "",
+      valueType: "boolean",
+      archived: false,
+      description: "",
+      version: 1,
+      holdout: { id: "holdout-1" } as HoldoutInterface,
+      environmentSettings: {
+        production: { enabled: true, rules: [] },
+      },
+    } as FeatureInterface;
+    const withId = getFeatureDefinition({
+      feature: featureWithHoldout,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      holdoutsMap,
+      capabilities: ["prerequisites"],
+      includeRuleIds: true,
+    });
+    const withoutId = getFeatureDefinition({
+      feature: featureWithHoldout,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      holdoutsMap,
+      capabilities: ["prerequisites"],
+      includeRuleIds: false,
+    });
+    expect(withId?.rules?.[0]).toBeDefined();
+    expect((withId?.rules?.[0] as Record<string, unknown>).id).toMatch(
+      /^holdout_/,
+    );
+    expect(withoutId?.rules?.[0]).toBeDefined();
+    expect(
+      (withoutId?.rules?.[0] as Record<string, unknown>).id,
+    ).toBeUndefined();
+  });
+
+  it("includeRuleIds controls inline experiment rule id", () => {
+    const feature: FeatureInterface = {
+      id: "f1",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      defaultValue: true,
+      organization: "org-1",
+      owner: "",
+      valueType: "boolean",
+      archived: false,
+      description: "",
+      version: 1,
+      environmentSettings: {
+        production: {
+          enabled: true,
+          rules: [
+            {
+              type: "experiment",
+              id: "inline-rule-id",
+              enabled: true,
+              coverage: 1,
+              values: [
+                { value: "v0", weight: 0.5, name: "C" },
+                { value: "v1", weight: 0.5, name: "T" },
+              ],
+              hashAttribute: "id",
+              seed: "s1",
+              namespace: { enabled: true, name: "ns", range: [0, 1] },
+            },
+          ],
+        },
+      },
+    } as FeatureInterface;
+    const withId = getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      capabilities: undefined,
+      includeRuleIds: true,
+    });
+    const withoutId = getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      capabilities: undefined,
+      includeRuleIds: false,
+    });
+    expect((withId?.rules?.[0] as Record<string, unknown>).id).toBe(
+      "inline-rule-id",
+    );
+    expect(
+      (withoutId?.rules?.[0] as Record<string, unknown>).id,
+    ).toBeUndefined();
+  });
+
+  it("encryptPayload true with encryptionKey produces encryptedFeatures", async () => {
+    const ctx = minimalContext();
+    const out = await getFeatureDefinitionsResponse({
+      features: { f1: { defaultValue: "x", rules: [] } },
+      experiments: [],
+      dateUpdated: new Date(),
+      encryptPayload: true,
+      encryptionKey: ENCRYPTION_KEY,
+      capabilities: [],
+      usedSavedGroups: [],
+      organization: ctx.org as OrganizationInterface,
+    });
+    expect(out.encryptedFeatures).toBeDefined();
+    expect(out.features).toEqual({});
+  });
+
+  it("encryptPayload false returns plain features", async () => {
+    const ctx = minimalContext();
+    const out = await getFeatureDefinitionsResponse({
+      features: { f1: { defaultValue: "x", rules: [] } },
+      experiments: [],
+      dateUpdated: new Date(),
+      encryptPayload: false,
+      encryptionKey: ENCRYPTION_KEY,
+      capabilities: [],
+      usedSavedGroups: [],
+      organization: ctx.org as OrganizationInterface,
+    });
+    expect(out.encryptedFeatures).toBeUndefined();
+    expect(out.features).toEqual({ f1: { defaultValue: "x", rules: [] } });
+  });
+
+  it("hashSecureAttributes with attributeSchema and salt hashes secure attributes", async () => {
+    const featureDef: FeatureDefinition = {
+      defaultValue: true,
+      rules: [
+        {
+          condition: { secret: { $eq: "plain" } },
+          force: false,
+        },
+      ],
+    };
+    const out = await getFeatureDefinitionsResponse({
+      features: { f1: cloneDeep(featureDef) },
+      experiments: [],
+      dateUpdated: new Date(),
+      capabilities: ["looseUnmarshalling"],
+      usedSavedGroups: [],
+      organization: minimalContext().org as OrganizationInterface,
+      attributes: [{ property: "secret", datatype: "secureString" as const }],
+      secureAttributeSalt: "salt",
+    });
+    const cond = (
+      out.features.f1.rules?.[0] as { condition: Record<string, unknown> }
+    ).condition;
+    expect(cond).toHaveProperty("secret");
+    expect(cond.secret).not.toBe("plain");
+  });
+
+  it("safe rollout running becomes experiment rule; rolled-back becomes force rule", () => {
+    const safeRollout: SafeRolloutInterface = {
+      id: "sr1",
+      organization: "org-1",
+      name: "SR",
+      description: "",
+      status: "running",
+      hashAttribute: "id",
+      seed: "s1",
+      coverage: 1,
+      variationWeights: [0.5, 0.5],
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      rampUpSchedule: {
+        enabled: true,
+        rampUpCompleted: true,
+        step: 0,
+        steps: [],
+      },
+    } as SafeRolloutInterface;
+    const safeRolloutMap = new Map([["sr1", safeRollout]]);
+    const featureWithRunning: FeatureInterface = {
+      id: "f1",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      defaultValue: true,
+      organization: "org-1",
+      owner: "",
+      valueType: "boolean",
+      archived: false,
+      description: "",
+      version: 1,
+      environmentSettings: {
+        production: {
+          enabled: true,
+          rules: [
+            {
+              type: "safe-rollout",
+              id: "r1",
+              enabled: true,
+              safeRolloutId: "sr1",
+              status: "running",
+              controlValue: "false",
+              variationValue: "true",
+              hashAttribute: "id",
+              seed: "s1",
+              trackingKey: "tk",
+              description: "",
+            },
+          ],
+        },
+      },
+    } as FeatureInterface;
+
+    const running = getFeatureDefinition({
+      feature: featureWithRunning,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap,
+      capabilities: ["bucketingV2"],
+      includeRuleIds: false,
+      includeExperimentNames: false,
+    });
+    expect(running.rules?.[0]).toHaveProperty("variations");
+    expect((running.rules?.[0] as Record<string, unknown>).force).not.toBe(
+      true,
+    );
+
+    const rolledBackMap = new Map([
+      [
+        "sr1",
+        { ...safeRollout, status: "rolled-back" } as SafeRolloutInterface,
+      ],
+    ]);
+    const rule0 = featureWithRunning.environmentSettings?.production
+      ?.rules?.[0] as Record<string, unknown> | undefined;
+    const featureRolledBack = {
+      ...cloneDeep(featureWithRunning),
+      environmentSettings: {
+        production: {
+          enabled: true,
+          rules: [
+            rule0
+              ? { ...rule0, status: "rolled-back" }
+              : { type: "safe-rollout", status: "rolled-back" },
+          ],
+        },
+      },
+    } as FeatureInterface;
+    const rolledBack = getFeatureDefinition({
+      feature: featureRolledBack,
+      environment: "production",
+      groupMap: new Map(),
+      experimentMap: new Map(),
+      safeRolloutMap: rolledBackMap,
+      capabilities: ["bucketingV2"],
+      includeRuleIds: false,
+      includeExperimentNames: false,
+    });
+    expect((rolledBack.rules?.[0] as Record<string, unknown>).force).toBe(
+      false,
+    );
+  });
+
+  describe("prerequisites, holdouts, and experiments permutations", () => {
+    // 2×2 matrix: (prerequisites capability: yes/no) × (deterministic parent: yes/no)
+    // Each case covers both top-level (feature.prerequisites → gating force rule) and
+    // rule-based (rule.prerequisites → parentConditions on rule) prerequisite types.
+    //
+    // Deterministic parent: always-true (no rules, defaultValue: true). Server-side
+    // reduceFeaturesWithPrerequisites strips these before getFeatureDefinition runs,
+    // so parentConditions are never set regardless of SDK capabilities.
+    //
+    // Non-deterministic (Schrödinger) parent: has an active experiment rule, so its
+    // value is uncertain at eval time. Server keeps these; scrubFeatures then acts on them
+    // based on the prerequisites capability:
+    //   - With prerequisites: parentConditions preserved for SDK to evaluate
+    //   - Without prerequisites: top-level gating rules → feature deleted; rule-level → rules filtered out
+
+    // Shared feature factories for the 4 prerequisite permutation tests
+    function makeParentDeterministic(): FeatureInterface {
+      return {
+        id: "parent-det",
+        project: "p1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "true",
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: { production: { enabled: true, rules: [] } },
+      } as FeatureInterface;
+    }
+
+    function makeParentConditional(): FeatureInterface {
+      return {
+        id: "parent-cond",
+        project: "p1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "true",
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: {
+          production: {
+            enabled: true,
+            // Experiment rule makes this non-deterministic: value varies across users
+            rules: [
+              {
+                type: "experiment",
+                id: "parent-exp",
+                enabled: true,
+                coverage: 1,
+                values: [
+                  { value: "false", weight: 0.5 },
+                  { value: "true", weight: 0.5 },
+                ],
+                hashAttribute: "id",
+              },
+            ],
+          },
+        },
+      } as FeatureInterface;
+    }
+
+    // child-top: only has feature-level prerequisites (tests gating force rule creation)
+    function makeChildTopLevel(parentId: string): FeatureInterface {
+      return {
+        id: "child-top",
+        project: "p1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "false",
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        prerequisites: [{ id: parentId, condition: '{"value": true}' }],
+        environmentSettings: { production: { enabled: true } },
+        rules: [],
+      } as FeatureInterface;
+    }
+
+    // child-rule: only has rule-level prerequisites (tests parentConditions on existing rule)
+    function makeChildRuleLevel(parentId: string): FeatureInterface {
+      return {
+        id: "child-rule",
+        project: "p1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "false",
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: {
+          production: { enabled: true },
+        },
+        rules: [
+          {
+            type: "experiment",
+            id: "r1",
+            allEnvironments: false,
+            environments: ["production"],
+            enabled: true,
+            coverage: 1,
+            values: [
+              { value: "false", weight: 0.5, name: "C" },
+              { value: "true", weight: 0.5, name: "T" },
+            ],
+            hashAttribute: "id",
+            seed: "s1",
+            prerequisites: [{ id: parentId, condition: '{"value": true}' }],
+          },
+        ],
+      } as FeatureInterface;
+    }
+
+    it("deterministic prereqs + prerequisites capability: server reduces always-true prereqs, no parentConditions in payload", async () => {
+      const parent = makeParentDeterministic();
+      const childTop = makeChildTopLevel("parent-det");
+      const childRule = makeChildRuleLevel("parent-det");
+      const data = minimalRawData({
+        features: [parent, childTop, childRule],
+        experimentMap: new Map(),
+      });
+
+      const result = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+
+      // Server stripped the always-true prerequisite; getFeatureDefinition never created a gating force rule.
+      // getFeatureDefinition deletes the rules key when the array is empty, so rules is undefined.
+      expect(result.features["child-top"]).toBeDefined();
+      expect(result.features["child-top"]?.rules).toBeUndefined();
+
+      // Rule-level prereq was also stripped server-side; no parentConditions on the experiment rule
+      expect(result.features["child-rule"]).toBeDefined();
+      expect(result.features["child-rule"]?.rules).toHaveLength(1);
+      expect(
+        (result.features["child-rule"]?.rules?.[0] as Record<string, unknown>)
+          ?.parentConditions,
+      ).toBeUndefined();
+    });
+
+    it("deterministic prereqs + no prerequisites capability: server reduces always-true prereqs, same result as with capability", async () => {
+      const parent = makeParentDeterministic();
+      const childTop = makeChildTopLevel("parent-det");
+      const childRule = makeChildRuleLevel("parent-det");
+      const data = minimalRawData({
+        features: [parent, childTop, childRule],
+        experimentMap: new Map(),
+      });
+
+      const result = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["bucketingV2"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+
+      // Server-side reduction runs before scrubFeatures; capability setting is irrelevant for deterministic prereqs
+      expect(result.features["child-top"]).toBeDefined();
+      expect(result.features["child-top"]?.rules).toBeUndefined();
+
+      expect(result.features["child-rule"]).toBeDefined();
+      expect(result.features["child-rule"]?.rules).toHaveLength(1);
+      expect(
+        (result.features["child-rule"]?.rules?.[0] as Record<string, unknown>)
+          ?.parentConditions,
+      ).toBeUndefined();
+    });
+
+    it("malformed deterministic prereq condition: gated feature and rule drop out, rest of payload builds", async () => {
+      const parent = makeParentDeterministic();
+      const childTop = makeChildTopLevel("parent-det");
+      childTop.prerequisites = [
+        { id: "parent-det", condition: '{"$not": null}' },
+      ];
+      const childRule = makeChildRuleLevel("parent-det");
+      childRule.rules[0].prerequisites = [
+        { id: "parent-det", condition: '{"$and": [null]}' },
+      ];
+      const data = minimalRawData({
+        features: [parent, childTop, childRule],
+        experimentMap: new Map(),
+      });
+
+      const result = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+
+      expect(result.features["parent-det"]).toBeDefined();
+      expect(result.features["child-top"]).toBeUndefined();
+      expect(result.features["child-rule"]).toBeDefined();
+      expect(result.features["child-rule"]?.rules).toBeUndefined();
+    });
+
+    it("non-deterministic prereqs + prerequisites capability: parentConditions preserved for SDK evaluation", async () => {
+      const parent = makeParentConditional();
+      const childTop = makeChildTopLevel("parent-cond");
+      const childRule = makeChildRuleLevel("parent-cond");
+      const data = minimalRawData({
+        features: [parent, childTop, childRule],
+        experimentMap: new Map(),
+      });
+
+      const result = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+
+      // Top-level: feature.prerequisites → gating force rule with parentConditions.gate = true
+      expect(result.features["child-top"]).toBeDefined();
+      expect(result.features["child-top"]?.rules).toHaveLength(1);
+      const topLevelRule = result.features["child-top"]?.rules?.[0] as Record<
+        string,
+        unknown
+      >;
+      expect(topLevelRule?.parentConditions).toBeDefined();
+      expect(
+        (topLevelRule?.parentConditions as Record<string, unknown>[])?.[0]
+          ?.gate,
+      ).toBe(true);
+
+      // Rule-level: experiment rule has parentConditions (no gate flag)
+      expect(result.features["child-rule"]).toBeDefined();
+      expect(result.features["child-rule"]?.rules).toHaveLength(1);
+      const ruleBasedRule = result.features["child-rule"]?.rules?.[0] as Record<
+        string,
+        unknown
+      >;
+      expect(ruleBasedRule?.parentConditions).toBeDefined();
+      expect(
+        (ruleBasedRule?.parentConditions as Record<string, unknown>[])?.[0]
+          ?.gate,
+      ).toBeUndefined();
+    });
+
+    it("non-deterministic prereqs + no prerequisites capability: top-level delivered ungated, rule-level feature removed", async () => {
+      const parent = makeParentConditional();
+      const childTop = makeChildTopLevel("parent-cond");
+      const childRule = makeChildRuleLevel("parent-cond");
+      const data = minimalRawData({
+        features: [parent, childTop, childRule],
+        experimentMap: new Map(),
+      });
+
+      const withoutPrereqs = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["bucketingV2"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+
+      // When connection lacks prerequisites, features with any gates (top-level or rule-level) are excluded.
+      expect(withoutPrereqs.features["child-top"]).toBeUndefined();
+      expect(withoutPrereqs.features["child-rule"]).toBeUndefined();
+
+      const withLooseUnmarshalling = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["bucketingV2", "looseUnmarshalling"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+      expect(withLooseUnmarshalling.features["child-top"]).toBeUndefined();
+      expect(withLooseUnmarshalling.features["child-rule"]).toBeUndefined();
+    });
+
+    it("prerequisites + project scoping: child in p1, parent in p2; connection [p1] drops child too", async () => {
+      const parent: FeatureInterface = {
+        id: "parent",
+        project: "p2",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: true,
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+        },
+      } as FeatureInterface;
+      const child: FeatureInterface = {
+        ...cloneDeep(parent),
+        id: "child",
+        project: "p1",
+        prerequisites: [{ id: "parent", condition: '{"value": true}' }],
+        environmentSettings: {
+          production: {
+            enabled: true,
+            rules: [
+              {
+                type: "experiment",
+                id: "r1",
+                enabled: true,
+                coverage: 1,
+                values: [
+                  { value: "v0", weight: 0.5, name: "C" },
+                  { value: "v1", weight: 0.5, name: "T" },
+                ],
+                hashAttribute: "id",
+                seed: "s1",
+                prerequisites: [{ id: "parent", condition: '{"value": true}' }],
+              },
+            ],
+          },
+        },
+      } as FeatureInterface;
+      const data = minimalRawData({
+        features: [parent, child],
+        experimentMap: new Map(),
+      });
+      const outP1Only = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: ["p1"],
+        },
+        data,
+      });
+      // Parent (p2) is not in filteredFeatures for a p1-only connection → reduction treats it as
+      // missing → child's prerequisite fails → child is also dropped. This mirrors SDK behavior:
+      // if parent isn't in the payload the SDK receives, it can't evaluate the prerequisite.
+      expect(Object.keys(outP1Only.features)).not.toContain("child");
+      expect(Object.keys(outP1Only.features)).not.toContain("parent");
+      const outBoth = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: [],
+        },
+        data,
+      });
+      // No project filter → parent in scope → prerequisite evaluates correctly → child included
+      expect(Object.keys(outBoth.features)).toContain("child");
+      expect(Object.keys(outBoth.features)).toContain("parent");
+    });
+
+    it("holdouts + capabilities: holdout rule on feature only when prerequisites capability", async () => {
+      const holdout: HoldoutInterface = {
+        id: "holdout-1",
+        organization: "org-1",
+        name: "H1",
+        description: "",
+        environment: "production",
+        projects: [],
+        experimentId: "exp1",
+        holdoutPercent: 0.1,
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+        },
+      } as HoldoutInterface;
+      const holdoutExperiment: ExperimentInterface = {
+        id: "exp1",
+        organization: "org-1",
+        project: "p1",
+        name: "Holdout Exp",
+        hypothesis: "",
+        status: "running",
+        phases: [
+          { phase: "main", coverage: 0.9, variationWeights: [0.5, 0.5] },
+        ],
+        variations: [
+          { id: "v0", key: "0", name: "C" },
+          { id: "v1", key: "1", name: "T" },
+        ],
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        trackingKey: "tk",
+        archived: false,
+      } as ExperimentInterface;
+      const holdoutsMap = new Map([
+        [
+          "holdout-1",
+          {
+            holdout,
+            holdoutExperiment /* renamed from `experiment` on main */,
+          },
+        ],
+      ]);
+      const featureWithHoldout: FeatureInterface = {
+        id: "f1",
+        project: "p1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: true,
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        holdout: { id: "holdout-1" } as HoldoutInterface,
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+        },
+      } as FeatureInterface;
+      const data = minimalRawData({
+        features: [featureWithHoldout],
+        holdoutsMap,
+        experimentMap: new Map([["exp1", holdoutExperiment]]),
+      });
+      const withPrereqs = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: ["p1"],
+        },
+        data,
+      });
+      expect(withPrereqs.features.f1?.rules?.length).toBeGreaterThanOrEqual(1);
+      expect(
+        (withPrereqs.features.f1?.rules?.[0] as Record<string, unknown>)
+          ?.parentConditions,
+      ).toBeDefined();
+
+      const withoutPrereqs = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["bucketingV2"],
+          environment: "production",
+          projects: ["p1"],
+        },
+        data,
+      });
+      // Without prerequisites capability, holdout rule is never generated (guarded by hasPrerequisites
+      // in getFeatureDefinition). With no other rules, defRules = [] → rules key is deleted entirely.
+      expect(withoutPrereqs.features.f1?.rules).toBeUndefined();
+    });
+
+    it("holdouts + project scoping: holdout with projects [p1] included for connection [p1], excluded for [p2]", async () => {
+      const holdout: HoldoutInterface = {
+        id: "holdout-1",
+        organization: "org-1",
+        name: "H1",
+        description: "",
+        environment: "production",
+        projects: ["p1"],
+        experimentId: "exp1",
+        holdoutPercent: 0.1,
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+        },
+      } as HoldoutInterface;
+      const holdoutExperiment: ExperimentInterface = {
+        id: "exp1",
+        organization: "org-1",
+        project: "p1",
+        name: "Holdout Exp",
+        hypothesis: "",
+        status: "running",
+        phases: [
+          { phase: "main", coverage: 0.9, variationWeights: [0.5, 0.5] },
+        ],
+        variations: [
+          { id: "v0", key: "0", name: "C" },
+          { id: "v1", key: "1", name: "T" },
+        ],
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        trackingKey: "tk",
+        archived: false,
+      } as ExperimentInterface;
+      const holdoutsMap = new Map([
+        [
+          "holdout-1",
+          {
+            holdout,
+            holdoutExperiment /* renamed from `experiment` on main */,
+          },
+        ],
+      ]);
+      const featureWithHoldout: FeatureInterface = {
+        id: "f1",
+        project: "p1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: true,
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        holdout: { id: "holdout-1" } as HoldoutInterface,
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+        },
+      } as FeatureInterface;
+      const data = minimalRawData({
+        features: [featureWithHoldout],
+        holdoutsMap,
+        experimentMap: new Map([["exp1", holdoutExperiment]]),
+      });
+      const outP1 = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: ["p1"],
+        },
+        data,
+      });
+      const holdoutDefId = "$holdout:holdout-1";
+      expect(outP1.features[holdoutDefId]).toBeDefined();
+      expect(outP1.features.f1?.rules?.length).toBeGreaterThanOrEqual(1);
+
+      const outP2 = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["prerequisites", "bucketingV2"],
+          environment: "production",
+          projects: ["p2"],
+        },
+        data,
+      });
+      expect(outP2.features[holdoutDefId]).toBeUndefined();
+      expect(Object.keys(outP2.features)).not.toContain(holdoutDefId);
+    });
+
+    it("experiments payload: only included when includeVisualExperiments or includeRedirectExperiments", async () => {
+      const data = basicMatrixData();
+      const withVisual = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: getSDKCapabilities("javascript", "1.6.5"),
+          environment: "production",
+          projects: [],
+          includeVisualExperiments: true,
+          includeRedirectExperiments: false,
+        },
+        data,
+      });
+      const withoutEither = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: getSDKCapabilities("javascript", "1.6.5"),
+          environment: "production",
+          projects: [],
+          includeVisualExperiments: false,
+          includeRedirectExperiments: false,
+        },
+        data,
+      });
+      expect(withVisual.experiments).toBeDefined();
+      expect(withoutEither.experiments).toBeUndefined();
+    });
+
+    it("experiments payload: project scoping filters which experiments are in payload", async () => {
+      const expP1: ExperimentInterface = {
+        id: "exp-p1",
+        organization: "org-1",
+        project: "p1",
+        name: "Exp P1",
+        hypothesis: "",
+        status: "running",
+        phases: [{ phase: "main", coverage: 1, variationWeights: [1] }],
+        variations: [{ id: "v0", key: "0", name: "C" }],
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        trackingKey: "tk",
+        archived: false,
+        hasVisualChangesets: true,
+      } as ExperimentInterface;
+      const visualChangeset = {
+        id: "vc1",
+        organization: "org-1",
+        experiment: "exp-p1",
+        urlPatterns: [{ include: true, type: "simple" as const, pattern: "*" }],
+        editorUrl: "",
+        visualChanges: [
+          {
+            id: "vc1",
+            description: "",
+            css: "",
+            variation: "v0",
+            domMutations: [],
+          },
+        ],
+      };
+      const data = minimalRawData({
+        features: [],
+        experimentMap: new Map([["exp-p1", expP1]]),
+        visualExperiments: [
+          { type: "visual" as const, experiment: expP1, visualChangeset },
+        ],
+      });
+      const outP1 = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["bucketingV2"],
+          environment: "production",
+          projects: ["p1"],
+          includeVisualExperiments: true,
+        },
+        data,
+      });
+      expect(outP1.experiments?.length).toBe(1);
+      expect(outP1.experiments?.[0].key).toBe("tk");
+
+      const outP2 = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: ["bucketingV2"],
+          environment: "production",
+          projects: ["p2"],
+          includeVisualExperiments: true,
+        },
+        data,
+      });
+      expect(outP2.experiments?.length).toBe(0);
+    });
+  });
+
+  it("includeDraftExperiments false filters draft experiments from response", async () => {
+    const ctx = minimalContext();
+    const featureDef: FeatureDefinition = {
+      defaultValue: true,
+      rules: [],
+    };
+    const draftExperiment = {
+      id: "exp-draft",
+      status: "draft",
+      condition: {},
+      variations: [{ id: "v0", key: "0", name: "C" }],
+      phases: [{ phase: "main", coverage: 1, variationWeights: [1] }],
+    };
+    const outExcluded = await getFeatureDefinitionsResponse({
+      features: { f1: cloneDeep(featureDef) },
+      experiments: [cloneDeep(draftExperiment)],
+      dateUpdated: new Date(),
+      includeDraftExperiments: false,
+      capabilities: [],
+      usedSavedGroups: [],
+      organization: ctx.org as OrganizationInterface,
+    });
+    expect(outExcluded.experiments).toEqual([]);
+
+    const outIncluded = await getFeatureDefinitionsResponse({
+      features: { f1: cloneDeep(featureDef) },
+      experiments: [cloneDeep(draftExperiment)],
+      dateUpdated: new Date(),
+      includeDraftExperiments: true,
+      capabilities: [],
+      usedSavedGroups: [],
+      organization: ctx.org as OrganizationInterface,
+    });
+    expect(outIncluded.experiments?.length).toBe(1);
+  });
+
+  describe("includeDraftExperimentRefs", () => {
+    // Draft experiment linked only via a feature flag (no visual changesets or redirects)
+    function draftRefData(): SDKPayloadRawData {
+      const exp: ExperimentInterface = {
+        id: "exp-draft-ref",
+        organization: "org-1",
+        project: "",
+        name: "Draft Ref Exp",
+        hypothesis: "",
+        status: "draft",
+        hashVersion: 2,
+        archived: false,
+        hasVisualChangesets: false,
+        hasURLRedirects: false,
+        linkedFeatures: ["fd"],
+        trackingKey: "tk-draft",
+        phases: [
+          {
+            phase: "main",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            seed: "draft-ref-seed",
+          },
+        ],
+        variations: [
+          { id: "v0", key: "0", name: "Control" },
+          { id: "v1", key: "1", name: "Treatment" },
+        ],
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+      } as ExperimentInterface;
+      const feature: FeatureInterface = {
+        id: "fd",
+        project: "",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "false",
+        organization: "org-1",
+        owner: "",
+        valueType: "boolean",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: {
+          production: {
+            enabled: true,
+            rules: [
+              {
+                type: "experiment-ref",
+                id: "rule-draft-ref",
+                enabled: true,
+                experimentId: "exp-draft-ref",
+                variations: [
+                  { variationId: "v0", value: "false" },
+                  { variationId: "v1", value: "true" },
+                ],
+              },
+            ],
+          },
+        },
+      } as FeatureInterface;
+      return minimalRawData({
+        features: [feature],
+        experimentMap: new Map([[exp.id, exp]]),
+      });
+    }
+
+    it("excludes feature-only draft experiment-ref rules by default", async () => {
+      const out = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: [],
+          environment: "production",
+          projects: [],
+        },
+        data: draftRefData(),
+      });
+      expect(out.features["fd"]?.rules ?? []).toEqual([]);
+    });
+
+    it("includes feature-only draft experiment-ref rules when enabled", async () => {
+      const out = await buildSDKPayloadForConnection({
+        context: minimalContext(),
+        connection: {
+          capabilities: [],
+          environment: "production",
+          projects: [],
+          includeDraftExperimentRefs: true,
+        },
+        data: draftRefData(),
+      });
+      const rules = out.features["fd"]?.rules ?? [];
+      expect(rules.length).toBe(1);
+      expect(rules[0].variations).toEqual([false, true]);
+    });
+  });
+
+  describe("contextual bandits gated by SDK version", () => {
+    const cbDoc = {
+      id: "cb1",
+      organization: "org-1",
+      name: "CB One",
+      status: "running",
+      trackingKey: "cb-track",
+      hashAttribute: "id",
+      seed: "cb-seed",
+      coverage: 1,
+      variations: [
+        { id: "v0", key: "0", name: "Control" },
+        { id: "v1", key: "1", name: "Treatment" },
+      ],
+      variationWeights: [
+        { variationId: "v0", weight: 0.5 },
+        { variationId: "v1", weight: 0.5 },
+      ],
+      currentLeafWeights: [
+        {
+          leafId: 1,
+          condition: { country: "US" },
+          weights: [
+            { variationId: "v0", weight: 0.6 },
+            { variationId: "v1", weight: 0.4 },
+          ],
+        },
+      ],
+      banditVersion: 3,
+    } as unknown as ContextualBanditInterface;
+
+    function cbContext(doc: ContextualBanditInterface = cbDoc): ApiReqContext {
+      const ctx = minimalContext();
+      ctx.models = {
+        contextualBandits: {
+          getByIds: async (ids: string[]) => (ids.includes("cb1") ? [doc] : []),
+        },
+      } as unknown as ApiReqContext["models"];
+      return ctx;
+    }
+
+    function cbData(overrides?: Partial<SDKPayloadRawData>): SDKPayloadRawData {
+      const feature: FeatureInterface = {
+        id: "f-cb",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "x",
+        organization: "org-1",
+        owner: "",
+        valueType: "string",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+        },
+        rules: [
+          {
+            type: "contextual-bandit-ref",
+            id: "r-cb",
+            description: "",
+            enabled: true,
+            contextualBanditId: "cb1",
+            variations: [
+              { variationId: "v0", value: "a" },
+              { variationId: "v1", value: "b" },
+            ],
+            allEnvironments: true,
+          } as FeatureRule,
+        ],
+      } as FeatureInterface;
+      return minimalRawData({ features: [feature], ...overrides });
+    }
+
+    const connectionForVersion = (
+      version: string,
+    ): ConnectionPayloadOptions => ({
+      capabilities: getSDKCapabilities(
+        "javascript",
+        version,
+      ) as ConnectionPayloadOptions["capabilities"],
+      environment: "production",
+      projects: [],
+    });
+
+    it("javascript 1.6.5: no contextualBandits map; rule has no contextualBanditRef and no variations (SDK skips it)", async () => {
+      const out = await buildSDKPayloadForConnection({
+        context: cbContext(),
+        connection: connectionForVersion("1.6.5"),
+        data: cbData(),
+      });
+      expect(out.contextualBandits).toBeUndefined();
+      const rules = out.features["f-cb"]?.rules as Record<string, unknown>[];
+      expect(rules?.length).toBe(1);
+      expect(rules[0].contextualBanditRef).toBeUndefined();
+      expect(rules[0].variations).toBeUndefined();
+    });
+
+    it("javascript 1.7.0: contextualBandits map and CB rule keys included", async () => {
+      const out = await buildSDKPayloadForConnection({
+        context: cbContext(),
+        connection: connectionForVersion("1.7.0"),
+        data: cbData(),
+      });
+      expect(out.contextualBandits).toEqual({
+        cb1: {
+          banditVersion: 3,
+          contexts: [
+            { leafId: 1, condition: { country: "US" }, weights: [0.6, 0.4] },
+          ],
+        },
+      });
+      const rules = out.features["f-cb"]?.rules as Record<string, unknown>[];
+      expect(rules?.length).toBe(1);
+      expect(rules[0].contextualBanditRef).toBe("cb1");
+      expect(rules[0].contextualVariations).toEqual(["a", "b"]);
+      expect(rules[0].weights).toEqual([0.5, 0.5]);
+      expect(rules[0].key).toBe("cb-track");
+      expect(rules[0].hashVersion).toBe(2);
+      expect(rules[0].disableStickyBucketing).toBe(true);
+      expect(rules[0].variations).toBeUndefined();
+    });
+
+    // The bandit's saved groups and prerequisites are its targeting too, so the
+    // rule carries them the way an experiment-ref rule carries its phase's.
+    const targetedCb = {
+      ...cbDoc,
+      condition: '{"country":"US"}',
+      savedGroups: [{ match: "all", ids: ["sg1"] }],
+      prerequisites: [
+        { id: "parent", condition: '{"value": {"$inGroup": "sg1"}}' },
+      ],
+    } as unknown as ContextualBanditInterface;
+    const sg1 = {
+      id: "sg1",
+      organization: "org-1",
+      groupName: "G1",
+      type: "list",
+      attributeKey: "x",
+      useEmptyListGroup: false,
+      values: ["a", "b"],
+    } as SavedGroupInterface;
+    const targetedData = {
+      groupMap: new Map([["sg1", sg1]]) as unknown as GroupMap,
+      savedGroups: [sg1],
+    };
+
+    it("javascript 1.7.0: the rule carries the bandit's saved groups and prerequisites", async () => {
+      const out = await buildSDKPayloadForConnection({
+        context: cbContext(targetedCb),
+        connection: connectionForVersion("1.7.0"),
+        data: cbData(targetedData),
+      });
+      const rules = out.features["f-cb"]?.rules as Record<string, unknown>[];
+      expect(JSON.stringify(rules[0].condition)).toMatch(/"country":"US"/);
+      // Saved groups are inlined for this SDK, in the gate as in the condition.
+      expect(JSON.stringify(rules[0].condition)).toMatch(/"a","b"/);
+      expect(rules[0].parentConditions).toEqual([
+        { id: "parent", condition: { value: { $in: ["a", "b"] } } },
+      ]);
+    });
+
+    it("javascript 0.33.0 (no prerequisites): a gated bandit's feature is left out", async () => {
+      const out = await buildSDKPayloadForConnection({
+        context: cbContext(targetedCb),
+        connection: connectionForVersion("0.33.0"),
+        data: cbData(targetedData),
+      });
+      expect(out.features["f-cb"]).toBeUndefined();
+    });
+  });
+
+  // Regression: the legacy SDK payload path read per-env rule arrays, so a
+  // feature with the unified top-level `rules: FeatureRule[]` and empty
+  // env-rules bucket emitted no rules at all. These cases pin the flat read path.
+  describe("v2 feature/revision rule read path", () => {
+    const v2BaseFeature = (): FeatureInterface =>
+      ({
+        id: "f1",
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        defaultValue: "x",
+        organization: "org-1",
+        owner: "",
+        valueType: "string",
+        archived: false,
+        description: "",
+        version: 1,
+        environmentSettings: {
+          production: { enabled: true, rules: [] },
+          dev: { enabled: true, rules: [] },
+        },
+      }) as FeatureInterface;
+
+    it("reads rules from the v2 top-level feature.rules array (allEnvironments)", () => {
+      const feature: FeatureInterface = {
+        ...v2BaseFeature(),
+        rules: [
+          {
+            type: "force",
+            id: "r-all",
+            description: "",
+            enabled: true,
+            value: "y",
+            allEnvironments: true,
+          } as FeatureRule,
+        ],
+      };
+      const def = getFeatureDefinition({
+        feature,
+        environment: "production",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        capabilities: undefined,
+        includeRuleIds: true,
+      });
+      expect(def?.rules).toBeDefined();
+      expect(def?.rules?.length).toBe(1);
+      expect((def?.rules?.[0] as Record<string, unknown>).id).toBe("r-all");
+      expect((def?.rules?.[0] as Record<string, unknown>).force).toBe("y");
+    });
+
+    it("reads rules from the v2 top-level revision.rules array and projects per env", () => {
+      const feature = v2BaseFeature();
+      const revision = {
+        organization: "org-1",
+        featureId: "f1",
+        version: 2,
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        createdBy: null,
+        status: "published",
+        baseVersion: 1,
+        comment: "",
+        defaultValue: "x",
+        rules: [
+          {
+            type: "force",
+            id: "r-prod",
+            description: "",
+            enabled: true,
+            value: "prod-only",
+            allEnvironments: false,
+            environments: ["production"],
+          } as FeatureRule,
+          {
+            type: "force",
+            id: "r-dev",
+            description: "",
+            enabled: true,
+            value: "dev-only",
+            allEnvironments: false,
+            environments: ["dev"],
+          } as FeatureRule,
+        ],
+      } as unknown as FeatureRevisionInterface;
+
+      const prodDef = getFeatureDefinition({
+        feature,
+        environment: "production",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        revision,
+        capabilities: undefined,
+        includeRuleIds: true,
+      });
+      expect(prodDef?.rules?.length).toBe(1);
+      expect((prodDef?.rules?.[0] as Record<string, unknown>).id).toBe(
+        "r-prod",
+      );
+
+      const devDef = getFeatureDefinition({
+        feature,
+        environment: "dev",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        revision,
+        capabilities: undefined,
+        includeRuleIds: true,
+      });
+      expect(devDef?.rules?.length).toBe(1);
+      expect((devDef?.rules?.[0] as Record<string, unknown>).id).toBe("r-dev");
+    });
+
+    it("v2 revision.rules takes precedence over feature.rules when both are present", () => {
+      const feature: FeatureInterface = {
+        ...v2BaseFeature(),
+        rules: [
+          {
+            type: "force",
+            id: "r-live",
+            description: "",
+            enabled: true,
+            value: "from-feature",
+            allEnvironments: true,
+          } as FeatureRule,
+        ],
+      };
+      const revision = {
+        organization: "org-1",
+        featureId: "f1",
+        version: 2,
+        dateCreated: new Date(),
+        dateUpdated: new Date(),
+        createdBy: null,
+        status: "draft",
+        baseVersion: 1,
+        comment: "",
+        defaultValue: "x",
+        rules: [
+          {
+            type: "force",
+            id: "r-draft",
+            description: "",
+            enabled: true,
+            value: "from-revision",
+            allEnvironments: true,
+          } as FeatureRule,
+        ],
+      } as unknown as FeatureRevisionInterface;
+
+      const def = getFeatureDefinition({
+        feature,
+        environment: "production",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        revision,
+        capabilities: undefined,
+        includeRuleIds: true,
+      });
+      expect(def?.rules?.length).toBe(1);
+      expect((def?.rules?.[0] as Record<string, unknown>).id).toBe("r-draft");
+      expect((def?.rules?.[0] as Record<string, unknown>).force).toBe(
+        "from-revision",
+      );
+    });
+
+    it("preserves global array order as per-env sub-order in the SDK payload", () => {
+      const feature: FeatureInterface = {
+        ...v2BaseFeature(),
+        rules: [
+          {
+            type: "force",
+            id: "r-1",
+            description: "",
+            enabled: true,
+            value: "a",
+            allEnvironments: false,
+            environments: ["production"],
+          } as FeatureRule,
+          {
+            type: "force",
+            id: "r-2",
+            description: "",
+            enabled: true,
+            value: "b",
+            allEnvironments: false,
+            environments: ["dev"],
+          } as FeatureRule,
+          {
+            type: "force",
+            id: "r-3",
+            description: "",
+            enabled: true,
+            value: "c",
+            allEnvironments: true,
+          } as FeatureRule,
+          {
+            type: "force",
+            id: "r-4",
+            description: "",
+            enabled: true,
+            value: "d",
+            allEnvironments: false,
+            environments: ["production"],
+          } as FeatureRule,
+        ],
+      };
+      const def = getFeatureDefinition({
+        feature,
+        environment: "production",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        capabilities: undefined,
+        includeRuleIds: true,
+      });
+      const ids = (def?.rules || []).map(
+        (r) => (r as Record<string, unknown>).id,
+      );
+      expect(ids).toEqual(["r-1", "r-3", "r-4"]);
+    });
+
+    // `allEnvironments: true` semantically means "all envs APPLICABLE to this
+    // feature" — `flattenV1ToV2Rules` collapses to it whenever a rule covers
+    // the project-scoped applicable env set. When the SDK definition iterates
+    // a non-applicable org env, the rule must NOT leak in. Origin/main avoided
+    // this naturally via per-env storage (the rule simply wasn't in
+    // `dev.rules`); we mirror that by intersecting with `applicableEnvs` at
+    // the consumer.
+    it("does not emit allEnvironments rules into project-scoped-out envs", () => {
+      const feature: FeatureInterface = {
+        ...v2BaseFeature(),
+        project: "prj_other",
+        rules: [
+          {
+            type: "force",
+            id: "r-prod-only",
+            description: "",
+            enabled: true,
+            value: "y",
+            allEnvironments: true,
+          } as FeatureRule,
+        ],
+      };
+      // `dev` is project-scoped to `prj_dev_only` — non-applicable to a
+      // feature in `prj_other`. `production` has no `projects` filter, so
+      // applies everywhere.
+      const organization = {
+        id: "org-1",
+        settings: {
+          environments: [
+            { id: "production" },
+            { id: "dev", projects: ["prj_dev_only"] },
+          ],
+        },
+      } as unknown as OrganizationInterface;
+
+      const prodDef = getFeatureDefinition({
+        feature,
+        environment: "production",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        capabilities: undefined,
+        includeRuleIds: true,
+        organization,
+      });
+      expect(prodDef?.rules?.length).toBe(1);
+      expect((prodDef?.rules?.[0] as Record<string, unknown>).id).toBe(
+        "r-prod-only",
+      );
+
+      const devDef = getFeatureDefinition({
+        feature,
+        environment: "dev",
+        groupMap: new Map(),
+        experimentMap: new Map(),
+        safeRolloutMap: new Map(),
+        capabilities: undefined,
+        includeRuleIds: true,
+        organization,
+      });
+      expect(devDef?.rules ?? []).toEqual([]);
+    });
+  });
+});
+
+function savedGroupFixture(
+  props: Pick<SavedGroupInterface, "id" | "type"> &
+    Partial<SavedGroupInterface>,
+): SavedGroupInterface {
+  return {
+    organization: "org-1",
+    groupName: props.id,
+    owner: "",
+    dateCreated: new Date(),
+    dateUpdated: new Date(),
+    ...props,
+  };
+}
+
+describe("applySavedGroupHashing with condition groups", () => {
+  const attributes: SDKAttributeSchema = [
+    { property: "email", datatype: "secureString" },
+    { property: "country", datatype: "string" },
+  ];
+
+  it("hashes secure attributes inside a condition group's condition", () => {
+    const groups: SavedGroupInterface[] = [
+      savedGroupFixture({
+        id: "cond_1",
+        type: "condition",
+        condition: JSON.stringify({ email: "a@b.com", country: "US" }),
+      }),
+    ];
+
+    const [hashed] = applySavedGroupHashing(groups, attributes, "salt");
+    const condition = JSON.parse(hashed.condition as string);
+    // secure attribute is hashed, non-secure is untouched
+    expect(condition.email).not.toBe("a@b.com");
+    expect(condition.country).toBe("US");
+  });
+
+  it("leaves an unparseable condition untouched rather than throwing", () => {
+    const groups: SavedGroupInterface[] = [
+      savedGroupFixture({
+        id: "cond_bad",
+        type: "condition",
+        condition: "{not json",
+      }),
+    ];
+
+    expect(() =>
+      applySavedGroupHashing(groups, attributes, "salt"),
+    ).not.toThrow();
+    expect(
+      applySavedGroupHashing(groups, attributes, "salt")[0].condition,
+    ).toBe("{not json");
+  });
+
+  it("still hashes list group values", () => {
+    const groups: SavedGroupInterface[] = [
+      savedGroupFixture({
+        id: "list_1",
+        type: "list",
+        attributeKey: "email",
+        values: ["a@b.com"],
+      }),
+    ];
+
+    const [hashed] = applySavedGroupHashing(groups, attributes, "salt");
+    expect(hashed.values?.[0]).not.toBe("a@b.com");
+  });
+});
+
+describe("getUsedSavedGroupIds", () => {
+  const groupMap: GroupMap = new Map([
+    ["list_1", { type: "list", attributeKey: "country", values: ["US"] }],
+    [
+      "cond_1",
+      {
+        type: "condition",
+        condition: JSON.stringify({ $savedGroups: ["list_1"] }),
+      },
+    ],
+    ["unused", { type: "list", attributeKey: "x", values: ["1"] }],
+  ]);
+
+  const featureWith = (
+    condition: ConditionInterface,
+  ): Record<string, FeatureDefinition> => ({
+    f: { defaultValue: "a", rules: [{ condition }] },
+  });
+
+  it("collects ids from the wire operator", () => {
+    expect(
+      getUsedSavedGroupIds(
+        featureWith({ $savedGroup: { id: "list_1" } }),
+        [],
+        groupMap,
+      ),
+    ).toEqual(new Set(["list_1"]));
+  });
+
+  it("collects ids from the legacy list operators", () => {
+    expect(
+      getUsedSavedGroupIds(
+        featureWith({ country: { $inGroup: "list_1" } }),
+        [],
+        groupMap,
+      ),
+    ).toEqual(new Set(["list_1"]));
+  });
+
+  it("includes derived remote groups and their source groups", () => {
+    const remoteMap: GroupMap = new Map([
+      ...groupMap,
+      ["vip", { type: "remote", attributeKey: "account_id" }],
+    ]);
+    expect(
+      getUsedSavedGroupIds(
+        featureWith({ $savedGroup: { id: "vip:parent_id" } }),
+        [],
+        remoteMap,
+      ),
+    ).toEqual(new Set(["vip:parent_id", "vip"]));
+    expect(
+      getUsedSavedGroupIds(
+        featureWith({ __gb_remoteGroupIds: { $in: ["vip:parent_id"] } }),
+        [],
+        remoteMap,
+      ),
+    ).toEqual(new Set(["vip:parent_id", "vip"]));
+  });
+
+  it("includes the source of a derived group named in a condition group", () => {
+    const remoteMap: GroupMap = new Map([
+      ...groupMap,
+      ["vip", { type: "remote", attributeKey: "account_id" }],
+      [
+        "cond_vip",
+        {
+          type: "condition",
+          condition: JSON.stringify({ $savedGroups: ["vip:parent_id"] }),
+        },
+      ],
+    ]);
+    expect(
+      getUsedSavedGroupIds(
+        featureWith({ $savedGroup: { id: "cond_vip" } }),
+        [],
+        remoteMap,
+      ),
+    ).toEqual(new Set(["cond_vip", "vip:parent_id", "vip"]));
+  });
+
+  it("includes groups reachable only through a shipped condition", () => {
+    // cond_1 references list_1, which no walk of the feature tree can see
+    expect(
+      getUsedSavedGroupIds(
+        featureWith({ $savedGroup: { id: "cond_1" } }),
+        [],
+        groupMap,
+      ),
+    ).toEqual(new Set(["cond_1", "list_1"]));
+  });
+
+  it("excludes groups nothing references", () => {
+    const used = getUsedSavedGroupIds(
+      featureWith({ $savedGroup: { id: "list_1" } }),
+      [],
+      groupMap,
+    );
+    expect(used.has("unused")).toBe(false);
+  });
+});
+
+describe("the connection's savedGroupFormat decides the payload", () => {
+  const groupMap: GroupMap = new Map([
+    ["grp_list", { type: "list", attributeKey: "id", values: ["u_1"] }],
+  ]);
+  const organization = { id: "org", settings: {} } as OrganizationInterface;
+
+  const feature = {
+    id: "f",
+    organization: "org",
+    defaultValue: "off",
+    valueType: "string",
+    environmentSettings: {
+      production: {
+        enabled: true,
+        rules: [
+          {
+            id: "r1",
+            type: "force",
+            value: "on",
+            enabled: true,
+            description: "",
+            savedGroups: [{ match: "all", ids: ["grp_list"] }],
+          },
+        ],
+      },
+    },
+  } as unknown as FeatureInterface;
+
+  const conditionFor = (
+    savedGroupFormat: SavedGroupFormat | undefined,
+    capabilities: string[],
+  ) =>
+    getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap,
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      organization,
+      capabilities: capabilities as ConnectionPayloadOptions["capabilities"],
+      savedGroupFormat,
+    })?.rules?.[0]?.condition;
+
+  const V1 = ["savedGroupReferences"];
+  const V2 = ["savedGroupReferences", "savedGroupReferencesV2"];
+
+  it("writes each format to an SDK that can read it", () => {
+    expect(conditionFor("inline", V2)).toEqual({ id: { $in: ["u_1"] } });
+    expect(conditionFor("referencesV1", V1)).toEqual({
+      id: { $inGroup: "grp_list" },
+    });
+    expect(conditionFor("referencesV2", V2)).toEqual({
+      $savedGroup: { id: "grp_list" },
+    });
+  });
+
+  it("steps v2 down to v1 when the SDK cannot read v2", () => {
+    expect(conditionFor("referencesV2", V1)).toEqual({
+      id: { $inGroup: "grp_list" },
+    });
+  });
+
+  it("steps references down to inline when the SDK can read neither", () => {
+    expect(conditionFor("referencesV2", ["bucketingV2"])).toEqual({
+      id: { $in: ["u_1"] },
+    });
+  });
+
+  // A connection that predates the setting has it derived by the model, and
+  // that derivation never picks v2.
+  it("inlines for a connection with no format at all", () => {
+    expect(conditionFor(undefined, V2)).toEqual({ id: { $in: ["u_1"] } });
+  });
+
+  it("gives a migrated connection v1, never v2, even on a v2 SDK", () => {
+    const migrated = savedGroupFormatFromConnection({
+      savedGroupReferencesEnabled: true,
+    });
+    expect(migrated).toBe("referencesV1");
+    expect(conditionFor(migrated, V2)).toEqual({
+      id: { $inGroup: "grp_list" },
+    });
+  });
+});
+
+describe("applySavedGroupHashing leaves saved group ids alone", () => {
+  it("does not hash ids nested in a Condition Group's own condition", () => {
+    // A secure attribute earlier in the same object turns hashing on, and the
+    // walk carries that into the ids unless they are exempt.
+    const [hashed] = applySavedGroupHashing(
+      [
+        savedGroupFixture({
+          id: "cond_1",
+          type: "condition",
+          condition: JSON.stringify({
+            email: "a@b.com",
+            $savedGroups: ["grp_a"],
+            $not: { $savedGroups: ["grp_b"] },
+          }),
+        }),
+      ],
+      [{ property: "email", datatype: "secureString" }] as SDKAttributeSchema,
+      "salt",
+    );
+    const condition = JSON.parse(hashed.condition as string);
+    expect(condition.email).not.toBe("a@b.com");
+    expect(condition.$savedGroups).toEqual(["grp_a"]);
+    expect(condition.$not.$savedGroups).toEqual(["grp_b"]);
+  });
+});
+
+describe("hashStrings leaves saved group references alone", () => {
+  it("does not hash a $savedGroup id, even when `id` is a secure attribute", () => {
+    // The reference's own key is `id`, so a walk that inherits attributes by
+    // key name would hash the group id and break the lookup.
+    const attributes: SDKAttributeSchema = [
+      { property: "id", datatype: "secureString" },
+    ];
+    expect(
+      hashStrings({
+        obj: {
+          $savedGroup: { id: "grp_1", attributeKey: "backup_id" },
+          $and: [{ id: { $notInGroup: "grp_2" } }],
+        },
+        salt: "salt",
+        attributes,
+      }),
+    ).toEqual({
+      $savedGroup: { id: "grp_1", attributeKey: "backup_id" },
+      $and: [{ id: { $notInGroup: "grp_2" } }],
+    });
+  });
+});
+
+describe("a v2 payload carries no v1 saved group operators", () => {
+  const groupMap: GroupMap = new Map([
+    ["grp_list", { type: "list", attributeKey: "id", values: ["u_1"] }],
+    ["grp_other", { type: "list", attributeKey: "country", values: ["US"] }],
+    [
+      "grp_cond",
+      { type: "condition", condition: JSON.stringify({ plan: "pro" }) },
+    ],
+  ]);
+  const organization = { id: "org", settings: {} } as OrganizationInterface;
+
+  // Every shape the rewrite has to deal with, in one feature
+  const feature = {
+    id: "f",
+    organization: "org",
+    defaultValue: "off",
+    valueType: "string",
+    prerequisites: [
+      {
+        id: "parent",
+        condition: JSON.stringify({ value: { $inGroup: "grp_list" } }),
+      },
+    ],
+    environmentSettings: {
+      production: {
+        enabled: true,
+        rules: [
+          {
+            id: "r1",
+            type: "force",
+            value: "on",
+            enabled: true,
+            description: "",
+            condition: JSON.stringify({
+              // matching attribute, mismatched attribute, Condition Group,
+              // unknown id, and both operators
+              id: { $inGroup: "grp_list" },
+              country: { $notInGroup: "grp_other" },
+              $and: [
+                { backup_id: { $inGroup: "grp_other" } },
+                { plan: { $inGroup: "grp_cond" } },
+                { region: { $notInGroup: "grp_missing" } },
+              ],
+            }),
+            savedGroups: [{ match: "all", ids: ["grp_list", "grp_cond"] }],
+          },
+        ],
+      },
+    },
+  } as unknown as FeatureInterface;
+
+  it("rewrites every $inGroup and $notInGroup", () => {
+    const def = getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap,
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      organization,
+      capabilities: [
+        "prerequisites",
+        "savedGroupReferences",
+        "savedGroupReferencesV2",
+      ] as ConnectionPayloadOptions["capabilities"],
+      savedGroupFormat: "referencesV2",
+    });
+
+    const serialized = JSON.stringify(def);
+    expect(serialized).not.toContain("$inGroup");
+    expect(serialized).not.toContain("$notInGroup");
+    expect(serialized).not.toContain("$savedGroups");
+  });
+});
+
+describe("feature-level prerequisites saved groups", () => {
+  const groupMap: GroupMap = new Map([
+    ["grp_value", { type: "list", attributeKey: "value", values: ["on"] }],
+  ]);
+  const organization = { id: "org", settings: {} } as OrganizationInterface;
+
+  const feature = {
+    id: "f",
+    organization: "org",
+    defaultValue: "off",
+    valueType: "string",
+    prerequisites: [
+      {
+        id: "parent",
+        condition: JSON.stringify({ value: { $inGroup: "grp_value" } }),
+      },
+    ],
+    environmentSettings: { production: { enabled: true, rules: [] } },
+  } as unknown as FeatureInterface;
+
+  // These rules are assembled outside the map that finalizes every other rule,
+  // so they are easy to miss.
+  const parentConditionFor = (capabilities: string[]) =>
+    getFeatureDefinition({
+      feature,
+      environment: "production",
+      groupMap,
+      experimentMap: new Map(),
+      safeRolloutMap: new Map(),
+      organization,
+      capabilities: capabilities as ConnectionPayloadOptions["capabilities"],
+      savedGroupFormat: "referencesV2",
+    })?.rules?.[0]?.parentConditions?.[0]?.condition;
+
+  it("rewrites a stored $inGroup under v2", () => {
+    expect(
+      parentConditionFor([
+        "prerequisites",
+        "savedGroupReferences",
+        "savedGroupReferencesV2",
+      ]),
+    ).toEqual({ $savedGroup: { id: "grp_value" } });
+  });
+
+  it("keeps a stored $inGroup under v1", () => {
+    expect(
+      parentConditionFor(["prerequisites", "savedGroupReferences"]),
+    ).toEqual({ value: { $inGroup: "grp_value" } });
+  });
+});
+
+describe("generateHoldoutsPayload saved groups", () => {
+  const groupMap: GroupMap = new Map([
+    ["grp_list", { type: "list", attributeKey: "id", values: ["u_1"] }],
+  ]);
+
+  const holdoutsMap = (condition: string) =>
+    new Map([
+      [
+        "ho_1",
+        {
+          holdout: { id: "ho_1" } as HoldoutInterface,
+          holdoutExperiment: {
+            trackingKey: "ho-key",
+            hashAttribute: "id",
+            phases: [{ coverage: 0.5, seed: "s", condition }],
+          } as unknown as ExperimentInterface,
+        },
+      ],
+    ]);
+
+  const conditionFor = (
+    capabilities: string[],
+    condition: string,
+  ): ConditionInterface | undefined =>
+    generateHoldoutsPayload({
+      holdoutsMap: holdoutsMap(condition),
+      groupMap,
+      capabilities: capabilities as ConnectionPayloadOptions["capabilities"],
+      savedGroupFormat: "referencesV2",
+    })["$holdout:ho_1"]?.rules?.[0]?.condition;
+
+  const V1 = ["savedGroupReferences"];
+  const V2 = ["savedGroupReferences", "savedGroupReferencesV2"];
+  const inGroup = JSON.stringify({ id: { $inGroup: "grp_list" } });
+
+  it("rewrites a stored $inGroup under v2, like every other rule path", () => {
+    expect(conditionFor(V2, inGroup)).toEqual({
+      $savedGroup: { id: "grp_list" },
+    });
+  });
+
+  it("keeps a stored $inGroup under v1", () => {
+    expect(conditionFor(V1, inGroup)).toEqual({ id: { $inGroup: "grp_list" } });
+  });
+
+  it("rewrites $savedGroups under v2", () => {
+    expect(
+      conditionFor(V2, JSON.stringify({ $savedGroups: ["grp_list"] })),
+    ).toEqual({ $savedGroup: { id: "grp_list" } });
+  });
+
+  it("leaves a condition with no saved groups alone", () => {
+    expect(conditionFor(V2, JSON.stringify({ country: "US" }))).toEqual({
+      country: "US",
+    });
+  });
+});
+
+describe("getApiFeatureObj saved groups", () => {
+  const groupMap: GroupMap = new Map([
+    ["grp_list", { type: "list", attributeKey: "id", values: ["u_1"] }],
+    [
+      "grp_cond",
+      { type: "condition", condition: JSON.stringify({ plan: "pro" }) },
+    ],
+  ]);
+
+  const organization = {
+    id: "org",
+    settings: { environments: [{ id: "production" }] },
+  } as OrganizationInterface;
+
+  const featureWithRule = (rule: Record<string, unknown>) =>
+    ({
+      id: "f",
+      organization: "org",
+      defaultValue: "off",
+      valueType: "string",
+      owner: "",
+      description: "",
+      project: "",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      version: 1,
+      environmentSettings: {
+        production: {
+          enabled: true,
+          rules: [
+            {
+              id: "r1",
+              type: "force",
+              value: "on",
+              description: "",
+              enabled: true,
+              ...rule,
+            },
+          ],
+        },
+      },
+    }) as unknown as FeatureInterface;
+
+  const definitionFor = (feature: FeatureInterface) =>
+    getApiFeatureObj({
+      feature,
+      organization,
+      groupMap,
+      experimentMap: new Map(),
+      revision: null,
+      safeRolloutMap: new Map(),
+    }).environments.production.definition;
+
+  // REST always serves referencesV1. There is no way for a caller to ask for
+  // another format, so these assert the one shape the endpoint can return.
+  it("keeps $inGroup and inlines Condition Groups", () => {
+    const feature = featureWithRule({
+      savedGroups: [{ match: "all", ids: ["grp_list", "grp_cond"] }],
+    });
+    expect(JSON.parse(definitionFor(feature) || "{}")).toEqual({
+      defaultValue: "off",
+      rules: [
+        {
+          condition: {
+            $and: [{ id: { $inGroup: "grp_list" } }, { plan: "pro" }],
+          },
+          force: "on",
+        },
+      ],
+    });
+  });
+
+  it("leaves a stored $inGroup as it is", () => {
+    const feature = featureWithRule({
+      condition: JSON.stringify({
+        id: { $inGroup: "grp_list" },
+        country: "US",
+      }),
+    });
+    expect(JSON.parse(definitionFor(feature) || "{}").rules[0]).toEqual({
+      condition: { id: { $inGroup: "grp_list" }, country: "US" },
+      force: "on",
+    });
+  });
+});

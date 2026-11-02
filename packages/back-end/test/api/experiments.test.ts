@@ -1,0 +1,3994 @@
+import request from "supertest";
+import mongoose from "mongoose";
+import {
+  getExperimentById,
+  getExperimentByTrackingKey,
+  createExperiment,
+  getAllExperiments,
+  updateExperiment,
+} from "../../src/models/ExperimentModel";
+import {
+  getLatestSuccessfulSnapshot,
+  getLatestSnapshotMultipleExperiments,
+} from "../../src/models/ExperimentSnapshotModel";
+import { getMetricsByIds } from "../../src/models/MetricModel";
+import { getDataSourceById } from "../../src/models/DataSourceModel";
+import { assertLivePayloadChangeAllowed } from "../../src/services/experimentLivePayload";
+import { assertValidExperimentPrerequisites } from "../../src/services/prerequisiteParents";
+import { BadRequestError, NotFoundError } from "../../src/util/errors";
+import { setupApp } from "./api.setup";
+
+// Serializers resolve legacy identifiers through the request's data source cache,
+// which these mock contexts don't have.
+jest.mock("back-end/src/services/assignmentQuerySelection", () => ({
+  ...jest.requireActual("back-end/src/services/assignmentQuerySelection"),
+  getExposureQueriesForDatasource: jest.fn().mockResolvedValue([]),
+}));
+
+jest.mock("../../src/services/files", () => ({
+  getSignedImageUrl: async (path) => `https://signed.example.com/${path}`,
+  uploadFile: jest
+    .fn()
+    .mockResolvedValue("/upload/org_1/2026-03/img_test123.png"),
+}));
+
+jest.mock("../../src/models/ExperimentModel", () => ({
+  getExperimentById: jest.fn(),
+  getExperimentByTrackingKey: jest.fn(),
+  createExperiment: jest.fn(),
+  updateExperiment: jest.fn(),
+  getAllExperiments: jest.fn(),
+}));
+
+jest.mock("../../src/models/ExperimentSnapshotModel", () => ({
+  getLatestSuccessfulSnapshot: jest.fn(),
+  getLatestSnapshotMultipleExperiments: jest.fn(),
+}));
+
+jest.mock("../../src/models/MetricModel", () => ({
+  getMetricMap: jest.fn().mockResolvedValue(new Map()),
+  getMetricsByIds: jest.fn().mockResolvedValue([]),
+}));
+
+jest.mock("../../src/models/DataSourceModel", () => ({
+  getDataSourceById: jest.fn(),
+}));
+
+jest.mock("../../src/services/experimentLivePayload", () => ({
+  assertLivePayloadChangeAllowed: jest.fn(),
+}));
+jest.mock("../../src/services/prerequisiteParents", () => ({
+  assertValidExperimentPrerequisites: jest.fn(),
+  phasePrerequisites: (phases: { prerequisites?: unknown[] }[] = []) =>
+    phases.flatMap((p) => p.prerequisites ?? []),
+}));
+
+// Not a plain import: "shared/util" loads shared from src, and import/order
+// would put it above ./api.setup. Loading it first leaves shared/experiments
+// half-loaded, which breaks the GET tests in this file.
+const { PermissionError } =
+  jest.requireActual<typeof import("shared/util")>("shared/util");
+
+describe("experiments API", () => {
+  const { app, setReqContext, updateReqContext } = setupApp();
+  const org = {
+    id: "org_1",
+    settings: {},
+    members: [],
+  };
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  beforeEach(() => {
+    setReqContext({
+      org,
+      organization: org,
+      models: {
+        metricGroups: {
+          getAll: jest.fn().mockResolvedValue([]),
+        },
+        urlRedirects: {
+          findByExperiment: jest.fn().mockResolvedValue([]),
+        },
+        customFields: {
+          getCustomFieldsBySectionAndProject: jest.fn().mockResolvedValue([]),
+        },
+        decisionCriteria: {
+          getById: jest.fn().mockResolvedValue(null),
+        },
+        projects: {
+          getById: jest.fn().mockResolvedValue(null),
+          getByIds: jest.fn().mockResolvedValue([]),
+          getAll: jest.fn().mockResolvedValue([]),
+          ensureProjectsExist: jest.fn().mockResolvedValue(undefined),
+        },
+        savedGroups: {
+          getAll: jest.fn().mockResolvedValue([]),
+          getAllWithoutValues: jest.fn().mockResolvedValue([]),
+        },
+        dataSources: {
+          getById: jest.fn().mockResolvedValue({
+            id: "ds_123",
+            type: "postgres",
+            settings: {
+              queries: {
+                exposure: [
+                  {
+                    id: "user_id",
+                    name: "User ID",
+                    userIdType: "user_id",
+                    userIdTypes: ["user_id"],
+                  },
+                ],
+              },
+            },
+          }),
+        },
+        factMetrics: {
+          getAll: jest.fn().mockResolvedValue([]),
+          getByIds: jest.fn().mockResolvedValue([]),
+        },
+      },
+      permissions: {
+        canViewExperiment: () => true,
+        canCreateExperiment: () => true,
+        canUpdateExperiment: () => true,
+        canAddComment: () => true,
+      },
+      hasPremiumFeature: () => false,
+      getUsersByIds: jest.fn().mockResolvedValue([]),
+    });
+  });
+
+  const experiment = {
+    id: "exp_123",
+    organization: "org_1",
+    trackingKey: "exp_123",
+    name: "Test Experiment",
+    type: "standard",
+    project: "proj_1",
+    projects: [],
+    hypothesis: "",
+    description: "",
+    tags: [],
+    owner: "",
+    dateCreated: new Date(),
+    dateUpdated: new Date(),
+    archived: false,
+    status: "running",
+    autoSnapshots: false,
+    hashAttribute: "id",
+    fallbackAttribute: undefined,
+    hashVersion: 2,
+    disableStickyBucketing: false,
+    bucketVersion: undefined,
+    minBucketVersion: undefined,
+    variations: [
+      {
+        id: "0",
+        key: "control",
+        name: "Control",
+        description: "",
+        screenshots: [{ path: "img1.png" }, { path: "img2.png" }],
+      },
+    ],
+    phases: [],
+    goalMetrics: [],
+    secondaryMetrics: [],
+    guardrailMetrics: [],
+    regressionAdjustmentEnabled: false,
+    sequentialTestingEnabled: false,
+    sequentialTestingTuningParameter: undefined,
+    activationMetric: undefined,
+    results: undefined,
+    winner: undefined,
+    analysis: undefined,
+    releasedVariationId: undefined,
+    excludeFromPayload: undefined,
+    shareLevel: "organization",
+    uid: undefined,
+    banditScheduleValue: undefined,
+    banditScheduleUnit: undefined,
+    banditBurnInValue: undefined,
+    banditBurnInUnit: undefined,
+    linkedFeatures: [],
+    hasVisualChangesets: false,
+    hasURLRedirects: false,
+    customFields: {},
+  };
+
+  describe("GET /api/v1/experiments/:id", () => {
+    it("returns 200 with experiment details", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("experiment");
+      expect(res.body.experiment).toMatchObject({
+        id: "exp_123",
+        trackingKey: "exp_123",
+        name: "Test Experiment",
+        type: "standard",
+        status: "running",
+      });
+    });
+
+    it("returns 404 when experiment not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(null);
+      const res = await request(app)
+        .get("/api/v1/experiments/nonexistent")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(404);
+      expect(res.body).toHaveProperty("message");
+    });
+
+    it("returns experiment with correct variation structure", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.variations).toHaveLength(1);
+      expect(res.body.experiment.variations[0]).toMatchObject({
+        variationId: "0",
+        key: "control",
+        name: "Control",
+      });
+    });
+
+    it("returns experiment with phases", async () => {
+      const experimentWithPhases = {
+        ...experiment,
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2024-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "test-seed",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: { enabled: false },
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithPhases);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.phases).toHaveLength(1);
+      expect(res.body.experiment.phases[0]).toMatchObject({
+        name: "Main",
+        coverage: 1,
+      });
+    });
+
+    it("serializes an enabled namespace with enabled: true so it round-trips", async () => {
+      const experimentWithNamespace = {
+        ...experiment,
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2024-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "test-seed",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: { enabled: true, name: "ns_1", range: [0, 0.5] },
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithNamespace,
+      );
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.phases[0].namespace).toMatchObject({
+        namespaceId: "ns_1",
+        enabled: true,
+      });
+    });
+
+    it("returns experiment with draft status", async () => {
+      const draftExperiment = { ...experiment, status: "draft" };
+      (getExperimentById as jest.Mock).mockResolvedValue(draftExperiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.status).toBe("draft");
+    });
+
+    it("returns experiment with running status", async () => {
+      const runningExperiment = { ...experiment, status: "running" };
+      (getExperimentById as jest.Mock).mockResolvedValue(runningExperiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.status).toBe("running");
+    });
+
+    it("returns experiment with stopped status", async () => {
+      const stoppedExperiment = {
+        ...experiment,
+        status: "stopped",
+        results: "won",
+        winner: 0,
+        analysis: "Control variation won",
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(stoppedExperiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.status).toBe("stopped");
+      expect(res.body.experiment.resultSummary).toBeDefined();
+      expect(res.body.experiment.resultSummary.status).toBe("won");
+    });
+
+    it("returns experiment with multiple variations", async () => {
+      const multiVariationExperiment = {
+        ...experiment,
+        variations: [
+          {
+            id: "0",
+            key: "control",
+            name: "Control",
+            description: "Original version",
+            screenshots: [],
+          },
+          {
+            id: "1",
+            key: "variation_1",
+            name: "Variation 1",
+            description: "First test variation",
+            screenshots: [{ path: "var1.png" }],
+          },
+          {
+            id: "2",
+            key: "variation_2",
+            name: "Variation 2",
+            description: "Second test variation",
+            screenshots: [],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        multiVariationExperiment,
+      );
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.variations).toHaveLength(3);
+      expect(res.body.experiment.variations[0].variationId).toBe("0");
+      expect(res.body.experiment.variations[1].variationId).toBe("1");
+      expect(res.body.experiment.variations[2].variationId).toBe("2");
+    });
+
+    it("returns signed screenshot URLs", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.variations[0].screenshots).toEqual([
+        "https://signed.example.com/img1.png",
+        "https://signed.example.com/img2.png",
+      ]);
+    });
+
+    it("returns experiment settings with correct structure", async () => {
+      const experimentWithSettings = {
+        ...experiment,
+        datasource: "ds_test",
+        exposureQueryId: "user_id",
+        exposureQueryIdentifierType: "anonymous_id",
+        segment: "seg_123",
+        goalMetrics: ["met_1", "met_2"],
+        secondaryMetrics: ["met_3"],
+        guardrailMetrics: ["met_4"],
+        activationMetric: "met_activation",
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithSettings,
+      );
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.settings).toBeDefined();
+      expect(res.body.experiment.settings.datasourceId).toBe("ds_test");
+      expect(res.body.experiment.settings.assignmentQueryId).toBe("user_id");
+      expect(res.body.experiment.settings.assignmentQuery).toEqual({
+        id: "user_id",
+        identifierType: "anonymous_id",
+      });
+      expect(res.body.experiment.settings.goals).toHaveLength(2);
+      expect(res.body.experiment.settings.secondaryMetrics).toHaveLength(1);
+      expect(res.body.experiment.settings.guardrails).toHaveLength(1);
+    });
+
+    it("returns regression adjustment settings", async () => {
+      const experimentWithRA = {
+        ...experiment,
+        regressionAdjustmentEnabled: true,
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithRA);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.settings.regressionAdjustmentEnabled).toBe(
+        true,
+      );
+    });
+
+    it("returns sequential testing settings", async () => {
+      const experimentWithST = {
+        ...experiment,
+        sequentialTestingEnabled: true,
+        sequentialTestingTuningParameter: 5000,
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithST);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.settings.sequentialTestingEnabled).toBe(true);
+      expect(
+        res.body.experiment.settings.sequentialTestingTuningParameter,
+      ).toBe(5000);
+    });
+
+    it("returns archived experiment", async () => {
+      const archivedExperiment = { ...experiment, archived: true };
+      (getExperimentById as jest.Mock).mockResolvedValue(archivedExperiment);
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiment.archived).toBe(true);
+    });
+  });
+
+  describe("GET /api/v1/experiments", () => {
+    it("returns signed screenshot URLs for all experiments", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments[0].variations[0].screenshots).toEqual([
+        "https://signed.example.com/img1.png",
+        "https://signed.example.com/img2.png",
+      ]);
+    });
+
+    it("returns empty array when no experiments exist", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toEqual([]);
+    });
+
+    it("returns multiple experiments", async () => {
+      const experiment2 = {
+        ...experiment,
+        id: "exp_456",
+        trackingKey: "exp_456",
+        name: "Second Experiment",
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experiment,
+        experiment2,
+      ]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(2);
+      expect(res.body.experiments[0].id).toBe("exp_123");
+      expect(res.body.experiments[1].id).toBe("exp_456");
+    });
+
+    it("filters experiments by project", async () => {
+      const projectExperiment = { ...experiment, project: "proj_1" };
+      (getAllExperiments as jest.Mock).mockResolvedValue([projectExperiment]);
+      const res = await request(app)
+        .get("/api/v1/experiments?projectId=proj_1")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].project).toBe("proj_1");
+    });
+
+    it("returns experiments with correct metadata", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments[0]).toHaveProperty("id");
+      expect(res.body.experiments[0]).toHaveProperty("trackingKey");
+      expect(res.body.experiments[0]).toHaveProperty("name");
+      expect(res.body.experiments[0]).toHaveProperty("status");
+      expect(res.body.experiments[0]).toHaveProperty("variations");
+    });
+
+    it("includes archived experiments in list when requested", async () => {
+      const archivedExp = { ...experiment, archived: true };
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experiment,
+        archivedExp,
+      ]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(2);
+    });
+
+    it("sorts by dateCreated ascending by default", async () => {
+      const older = {
+        ...experiment,
+        id: "exp_older",
+        dateCreated: new Date("2020-01-01"),
+      };
+      const newer = {
+        ...experiment,
+        id: "exp_newer",
+        dateCreated: new Date("2024-01-01"),
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([newer, older]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments.map((e: { id: string }) => e.id)).toEqual([
+        "exp_older",
+        "exp_newer",
+      ]);
+    });
+
+    it("sorts by name descending, case-insensitively", async () => {
+      const apple = { ...experiment, id: "exp_apple", name: "apple test" };
+      const zebra = { ...experiment, id: "exp_zebra", name: "Zebra test" };
+      (getAllExperiments as jest.Mock).mockResolvedValue([apple, zebra]);
+      const res = await request(app)
+        .get("/api/v1/experiments?sortBy=name&sortOrder=desc")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      // Case-insensitive: "Zebra" sorts after "apple" despite uppercase Z
+      expect(res.body.experiments.map((e: { id: string }) => e.id)).toEqual([
+        "exp_zebra",
+        "exp_apple",
+      ]);
+    });
+
+    it("rejects an unsupported sortBy field", async () => {
+      const res = await request(app)
+        .get("/api/v1/experiments?sortBy=owner")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+    });
+
+    it("filters by comma-separated tags", async () => {
+      const tagged = { ...experiment, id: "exp_tagged", tags: ["checkout"] };
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment, tagged]);
+      const res = await request(app)
+        .get("/api/v1/experiments?tag=checkout,promo")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].id).toBe("exp_tagged");
+    });
+
+    it("filters by implementation type", async () => {
+      const withFeature = {
+        ...experiment,
+        id: "exp_feature",
+        linkedFeatures: ["feat_1"],
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experiment,
+        withFeature,
+      ]);
+      const res = await request(app)
+        .get("/api/v1/experiments?implementationType=feature")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].id).toBe("exp_feature");
+    });
+
+    it("rejects an unsupported implementationType value", async () => {
+      const res = await request(app)
+        .get("/api/v1/experiments?implementationType=banana")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+    });
+
+    it("filters by owner id", async () => {
+      const owned = { ...experiment, id: "exp_owned", owner: "u_123" };
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment, owned]);
+      const res = await request(app)
+        .get("/api/v1/experiments?owner=u_123")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].id).toBe("exp_owned");
+    });
+
+    it("filters by result", async () => {
+      const won = {
+        ...experiment,
+        id: "exp_won",
+        status: "stopped",
+        results: "won",
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment, won]);
+      const res = await request(app)
+        .get("/api/v1/experiments?result=won,lost")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].id).toBe("exp_won");
+    });
+
+    it("rejects an unsupported result value", async () => {
+      const res = await request(app)
+        .get("/api/v1/experiments?result=maybe")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+    });
+
+    it("filters by metric id across goal, secondary, and guardrail metrics", async () => {
+      const withMetric = {
+        ...experiment,
+        id: "exp_metric",
+        guardrailMetrics: ["met_1"],
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experiment,
+        withMetric,
+      ]);
+      const res = await request(app)
+        .get("/api/v1/experiments?metricId=met_1")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].id).toBe("exp_metric");
+    });
+
+    it("filters bandits in or out with the bandits param", async () => {
+      const bandit = {
+        ...experiment,
+        id: "exp_bandit",
+        type: "multi-armed-bandit",
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment, bandit]);
+
+      const onlyBandits = await request(app)
+        .get("/api/v1/experiments?bandits=true")
+        .set("Authorization", "Bearer foo");
+      expect(onlyBandits.status).toBe(200);
+      expect(onlyBandits.body.experiments).toHaveLength(1);
+      expect(onlyBandits.body.experiments[0].id).toBe("exp_bandit");
+
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment, bandit]);
+      const noBandits = await request(app)
+        .get("/api/v1/experiments?bandits=false")
+        .set("Authorization", "Bearer foo");
+      expect(noBandits.status).toBe(200);
+      expect(noBandits.body.experiments).toHaveLength(1);
+      expect(noBandits.body.experiments[0].id).toBe("exp_123");
+    });
+
+    it("applies filters from a q search string", async () => {
+      const tagged = { ...experiment, id: "exp_tagged", tags: ["checkout"] };
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment, tagged]);
+      const res = await request(app)
+        .get("/api/v1/experiments?q=tag:checkout")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experiments).toHaveLength(1);
+      expect(res.body.experiments[0].id).toBe("exp_tagged");
+    });
+
+    it("rejects unsupported q search syntax", async () => {
+      const res = await request(app)
+        .get("/api/v1/experiments?q=tag:!checkout")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+    });
+
+    it("leaves the archived filter unset when the param is omitted", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment]);
+      const res = await request(app)
+        .get("/api/v1/experiments")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(getAllExperiments).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ archived: undefined, includeArchived: true }),
+      );
+    });
+
+    it.each([
+      ["true", true],
+      ["false", false],
+    ])("passes archived=%s through as a boolean", async (param, value) => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([experiment]);
+      const res = await request(app)
+        .get(`/api/v1/experiments?archived=${param}`)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(getAllExperiments).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ archived: value }),
+      );
+    });
+  });
+
+  describe("POST /api/v1/experiments", () => {
+    it("creates experiment with signed screenshot URLs", async () => {
+      updateReqContext({
+        org,
+        models: {
+          projects: {
+            ensureProjectsExist: jest.fn().mockResolvedValue(undefined),
+            getById: jest.fn().mockResolvedValue(null),
+          },
+        },
+        permissions: {
+          canCreateExperiment: () => true,
+        },
+      });
+
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id", "anonymous_id"],
+              },
+            ],
+          },
+        },
+      });
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+      (createExperiment as jest.Mock).mockResolvedValue(experiment);
+
+      const createPayload = {
+        trackingKey: "exp_new",
+        name: "New Experiment",
+        hypothesis: "This will increase conversions",
+        datasourceId: "ds_123",
+        assignmentQuery: { id: "user_id", identifierType: "anonymous_id" },
+        variations: [
+          {
+            key: "control",
+            name: "Control",
+            description: "Original version",
+            screenshots: [{ path: "img1.png" }, { path: "img2.png" }],
+          },
+          {
+            key: "treatment",
+            name: "Treatment",
+            description: "New version",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send(createPayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("experiment");
+      expect(createExperiment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            exposureQueryIdentifierType: "anonymous_id",
+          }),
+        }),
+      );
+    });
+
+    it("rejects assignmentQuery and the deprecated flat id naming different queries", async () => {
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id"],
+              },
+            ],
+          },
+        },
+      });
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_conflict",
+          name: "Conflict",
+          datasourceId: "ds_123",
+          assignmentQuery: { id: "user_id", identifierType: "user_id" },
+          assignmentQueryId: "anonymous_id",
+          variations: [
+            { key: "control", name: "Control" },
+            { key: "treatment", name: "Treatment" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("name different assignment queries");
+      expect(createExperiment).not.toHaveBeenCalled();
+    });
+
+    describe("assignment query selection", () => {
+      const variations = [
+        { key: "control", name: "Control" },
+        { key: "treatment", name: "Treatment" },
+      ];
+      const template = {
+        id: "tmplt__1",
+        datasource: "ds_123",
+        targeting: { coverage: 1, condition: "{}" },
+        goalMetrics: [],
+      };
+      beforeEach(() => {
+        (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+        (createExperiment as jest.Mock).mockResolvedValue(experiment);
+        (getDataSourceById as jest.Mock).mockResolvedValue({
+          id: "ds_123",
+          type: "postgres",
+          settings: {
+            queries: {
+              exposure: [
+                {
+                  id: "eq_multi",
+                  name: "Multi",
+                  userIdType: "anonymous_id",
+                  userIdTypes: ["user_id", "anonymous_id"],
+                },
+                {
+                  id: "eq_dropped",
+                  name: "Dropped",
+                  userIdType: "user_id",
+                  userIdTypes: ["anonymous_id"],
+                },
+              ],
+            },
+          },
+        });
+      });
+      const createdData = () =>
+        (createExperiment as jest.Mock).mock.calls[0][0].data;
+      const post = (body: Record<string, unknown>) =>
+        request(app)
+          .post("/api/v1/experiments")
+          .send({ trackingKey: "exp_new", name: "New", variations, ...body })
+          .set("Authorization", "Bearer foo");
+
+      it("rejects a flat-id create on a query that declares several identifier types", async () => {
+        const res = await post({
+          datasourceId: "ds_123",
+          assignmentQueryId: "eq_multi",
+        });
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toBe(
+          'Assignment query "Multi" declares several identifier types (user_id, anonymous_id). Set assignmentQuery.identifierType to choose one.',
+        );
+        expect(createExperiment).not.toHaveBeenCalled();
+      });
+
+      it("rejects a flat-id create on a query that dropped its legacy identifier", async () => {
+        const res = await post({
+          datasourceId: "ds_123",
+          assignmentQueryId: "eq_dropped",
+        });
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toBe(
+          'Assignment query "Dropped" no longer declares its default identifier type "user_id". Set assignmentQuery.identifierType to choose one.',
+        );
+        expect(createExperiment).not.toHaveBeenCalled();
+      });
+
+      it("leaves a template-derived create implicit when the template is", async () => {
+        updateReqContext({
+          models: {
+            experimentTemplates: {
+              getById: jest.fn().mockResolvedValue({
+                ...template,
+                exposureQueryId: "eq_multi",
+              }),
+            },
+          },
+        });
+
+        const res = await post({ templateId: "tmplt__1" });
+
+        expect(res.status).toBe(200);
+        expect(createdData()).toMatchObject({
+          datasource: "ds_123",
+          exposureQueryId: "eq_multi",
+        });
+        expect(createdData().exposureQueryIdentifierType).toBeUndefined();
+      });
+
+      it("copies a template's explicit identifier", async () => {
+        updateReqContext({
+          models: {
+            experimentTemplates: {
+              getById: jest.fn().mockResolvedValue({
+                ...template,
+                exposureQueryId: "eq_multi",
+                exposureQueryIdentifierType: "user_id",
+              }),
+            },
+          },
+        });
+
+        const res = await post({ templateId: "tmplt__1" });
+
+        expect(res.status).toBe(200);
+        expect(createdData().exposureQueryIdentifierType).toBe("user_id");
+      });
+
+      it("rejects a template whose query dropped its legacy identifier", async () => {
+        updateReqContext({
+          models: {
+            experimentTemplates: {
+              getById: jest.fn().mockResolvedValue({
+                ...template,
+                exposureQueryId: "eq_dropped",
+              }),
+            },
+          },
+        });
+
+        const res = await post({ templateId: "tmplt__1" });
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toBe(
+          'Template "tmplt__1": Assignment query "Dropped" no longer declares its default identifier type "user_id". Set exposureQuery.identifierType to choose one. Update the template\'s assignment settings.',
+        );
+        expect(createExperiment).not.toHaveBeenCalled();
+      });
+    });
+
+    it("rejects a phase prerequisite on a flag that does not exist", async () => {
+      jest
+        .mocked(assertValidExperimentPrerequisites)
+        .mockRejectedValueOnce(
+          new NotFoundError('Prerequisite feature "missing_flag" not found'),
+        );
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id"],
+              },
+            ],
+          },
+        },
+      });
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_gated",
+          name: "Gated",
+          datasourceId: "ds_123",
+          assignmentQueryId: "user_id",
+          variations: [
+            { key: "0", name: "Control", description: "", screenshots: [] },
+            { key: "1", name: "Treatment", description: "", screenshots: [] },
+          ],
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-01-01T00:00:00.000Z",
+              prerequisites: [
+                { id: "missing_flag", condition: '{"value": true}' },
+              ],
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.body.message).toMatch(
+        /Prerequisite feature "missing_flag" not found/,
+      );
+      expect(res.status).toBe(404);
+      expect(assertValidExperimentPrerequisites).toHaveBeenCalledWith(
+        expect.anything(),
+        [{ id: "missing_flag", condition: '{"value": true}' }],
+      );
+      expect(createExperiment).not.toHaveBeenCalled();
+    });
+
+    // Phase saved groups reach the payload like a rule's, and get its checks.
+    it("rejects a phase saved group that does not exist", async () => {
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id"],
+              },
+            ],
+          },
+        },
+      });
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_targeting",
+          name: "Targeting",
+          datasourceId: "ds_123",
+          assignmentQueryId: "user_id",
+          variations: [
+            { key: "0", name: "Control", description: "", screenshots: [] },
+            { key: "1", name: "Treatment", description: "", screenshots: [] },
+          ],
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-01-01T00:00:00.000Z",
+              savedGroupTargeting: [
+                { matchType: "all", savedGroups: ["grp_missing"] },
+              ],
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+      expect(res.body.message).toMatch(/grp_missing/);
+      expect(res.status).toBe(404);
+      expect(createExperiment).not.toHaveBeenCalled();
+    });
+
+    it("preserves id and variationId values when creating an experiment", async () => {
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id"],
+              },
+            ],
+          },
+        },
+      });
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+      (createExperiment as jest.Mock).mockResolvedValue(experiment);
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_custom_variation_ids",
+          name: "Custom variation IDs",
+          datasourceId: "ds_123",
+          assignmentQueryId: "user_id",
+          variations: [
+            {
+              id: "control",
+              variationId: "ignored",
+              key: "control",
+              name: "Control",
+            },
+            {
+              variationId: "treatment",
+              key: "treatment",
+              name: "Treatment",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const createCall = (createExperiment as jest.Mock).mock.calls[0][0];
+      expect(createCall.data.variations.map((v) => v.id)).toEqual([
+        "control",
+        "treatment",
+      ]);
+      expect(createCall.data.phases[0].variations).toEqual([
+        { id: "control", status: "active" },
+        { id: "treatment", status: "active" },
+      ]);
+    });
+
+    it("rejects duplicate user-specified variation ids", async () => {
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id"],
+              },
+            ],
+          },
+        },
+      });
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_duplicate_variation_ids",
+          name: "Duplicate variation IDs",
+          datasourceId: "ds_123",
+          assignmentQueryId: "user_id",
+          variations: [
+            {
+              id: "duplicate",
+              key: "control",
+              name: "Control",
+            },
+            {
+              variationId: "duplicate",
+              key: "treatment",
+              name: "Treatment",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toBe("Variation IDs must be unique.");
+      expect(createExperiment).not.toHaveBeenCalled();
+    });
+
+    it("rejects create when required custom fields are missing", async () => {
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject: jest.fn().mockResolvedValue([
+              {
+                id: "cfd_team",
+                name: "Owning Team",
+                type: "enum",
+                required: true,
+                values: "growth,platform",
+                section: "experiment",
+                dateCreated: new Date("2026-01-01"),
+                dateUpdated: new Date("2026-01-01"),
+              },
+            ]),
+          },
+        },
+      });
+
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+
+      const createPayload = {
+        trackingKey: "exp_new",
+        name: "New Experiment",
+        hypothesis: "This will increase conversions",
+        datasourceId: "ds_123",
+        assignmentQueryId: "user_id",
+        variations: [
+          {
+            key: "control",
+            name: "Control",
+            description: "Original version",
+            screenshots: [{ path: "img1.png" }, { path: "img2.png" }],
+          },
+          {
+            key: "treatment",
+            name: "Treatment",
+            description: "New version",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send(createPayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(
+        'Custom field "Owning Team" is required.',
+      );
+      expect(createExperiment).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 when trackingKey already exists", async () => {
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(experiment);
+
+      const createPayload = {
+        trackingKey: "exp_123",
+        name: "Duplicate Experiment",
+        hypothesis: "",
+        assignmentQueryId: "user_id",
+        variations: [
+          {
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send(createPayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("message");
+      expect(res.body.message).toContain("already exists");
+    });
+
+    it("allows duplicate trackingKey when bypassDuplicateKeyCheck is true", async () => {
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(experiment);
+      (createExperiment as jest.Mock).mockResolvedValue(experiment);
+
+      const createPayload = {
+        trackingKey: "exp_123",
+        name: "Duplicate Experiment",
+        hypothesis: "",
+        assignmentQueryId: "user_id",
+        bypassDuplicateKeyCheck: true,
+        variations: [
+          {
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send(createPayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("experiment");
+      // When bypassDuplicateKeyCheck is true and the org doesn't require unique
+      // tracking keys, the duplicate-key lookup is skipped entirely.
+      expect(getExperimentByTrackingKey).not.toHaveBeenCalled();
+    });
+
+    it("rejects duplicate trackingKey when requireUniqueExperimentTrackingKeys is enabled, even with bypassDuplicateKeyCheck", async () => {
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(experiment);
+
+      const orgWithSetting = {
+        ...org,
+        settings: { requireUniqueExperimentTrackingKeys: true },
+      };
+
+      updateReqContext({
+        org: orgWithSetting,
+        organization: orgWithSetting,
+        models: {
+          decisionCriteria: {
+            getById: jest.fn().mockResolvedValue(null),
+          },
+          projects: {
+            getById: jest.fn().mockResolvedValue(null),
+            ensureProjectsExist: jest.fn().mockResolvedValue(undefined),
+            getByIds: jest.fn().mockResolvedValue([]),
+          },
+          metricGroups: {
+            getAll: jest.fn().mockResolvedValue([]),
+          },
+          customFields: {
+            getCustomFieldsBySectionAndProject: jest.fn().mockResolvedValue([]),
+          },
+        },
+        permissions: {
+          canViewExperiment: () => true,
+          canCreateExperiment: () => true,
+          canUpdateExperiment: () => true,
+          canAddComment: () => true,
+        },
+      });
+
+      const createPayload = {
+        trackingKey: "exp_123",
+        name: "Duplicate Experiment",
+        hypothesis: "",
+        assignmentQueryId: "user_id",
+        bypassDuplicateKeyCheck: true,
+        variations: [
+          {
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send(createPayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("message");
+      expect(res.body.message).toContain(
+        "requires unique experiment tracking keys",
+      );
+    });
+
+    it("rejects a trackingKey that doesn't match experimentKeyRegexValidator", async () => {
+      const orgWithSetting = {
+        ...org,
+        settings: { experimentKeyRegexValidator: "^exp-" },
+      };
+      updateReqContext({
+        org: orgWithSetting,
+        organization: orgWithSetting,
+        permissions: { canCreateExperiment: () => true },
+      });
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_123",
+          name: "Bad key",
+          assignmentQueryId: "user_id",
+          variations: [
+            { key: "control", name: "Control" },
+            { key: "treatment", name: "Treatment" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("must match the regex validator");
+      expect(res.body.code).toBe("invalid_tracking_key");
+      expect(createExperiment).not.toHaveBeenCalled();
+    });
+
+    it("validates datasource exists", async () => {
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+      (getDataSourceById as jest.Mock).mockResolvedValue(null); // Mock datasource not found
+
+      updateReqContext({
+        org,
+        organization: org,
+        models: {
+          decisionCriteria: {
+            getById: jest.fn().mockResolvedValue(null),
+          },
+          projects: {
+            getById: jest.fn().mockResolvedValue(null),
+            ensureProjectsExist: jest.fn().mockResolvedValue(undefined),
+          },
+          dataSources: {
+            getById: jest.fn().mockResolvedValue(null), // datasource not found
+          },
+        },
+        permissions: {
+          canViewExperiment: () => true,
+          canCreateExperiment: () => true,
+          canUpdateExperiment: () => true,
+        },
+      });
+
+      const createPayload = {
+        trackingKey: "exp_new",
+        name: "New Experiment",
+        hypothesis: "",
+        datasourceId: "invalid_ds",
+        assignmentQueryId: "user_id",
+        variations: [
+          {
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send(createPayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("Invalid data source");
+    });
+
+    it("rejects an unresolvable email owner", async () => {
+      updateReqContext({
+        getUserByEmail: jest.fn().mockResolvedValue(null),
+      });
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_new",
+          name: "New Experiment",
+          assignmentQueryId: "user_id",
+          owner: "unknown@example.com",
+          variations: [
+            { key: "control", name: "Control" },
+            { key: "treatment", name: "Treatment" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("Unable to find user");
+    });
+
+    it("resolves email to userId when creating an experiment", async () => {
+      const testUser = { id: "u_user1", email: "user@example.com" };
+      updateReqContext({
+        org: { ...org, members: [{ id: testUser.id }] },
+        getUserByEmail: jest.fn().mockResolvedValue(testUser),
+        models: {
+          watch: { upsertWatch: jest.fn().mockResolvedValue(undefined) },
+        },
+      });
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(null);
+      (createExperiment as jest.Mock).mockResolvedValue(experiment);
+
+      const res = await request(app)
+        .post("/api/v1/experiments")
+        .send({
+          trackingKey: "exp_new",
+          name: "New Experiment",
+          assignmentQueryId: "user_id",
+          owner: testUser.email,
+          variations: [
+            { key: "control", name: "Control" },
+            { key: "treatment", name: "Treatment" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(createExperiment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ owner: testUser.id }),
+        }),
+      );
+    });
+  });
+
+  describe("POST /api/v1/experiments/:id", () => {
+    it("updates experiment successfully", async () => {
+      const updatedExperiment = {
+        ...experiment,
+        name: "Updated Experiment Name",
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockResolvedValue(updatedExperiment);
+
+      const updatePayload = {
+        name: "Updated Experiment Name",
+        hypothesis: "Updated hypothesis",
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send(updatePayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("experiment");
+      expect(res.body.experiment.name).toBe("Updated Experiment Name");
+    });
+
+    describe("run-experiments permission for payload-affecting fields", () => {
+      // An experiment that reaches every environment (visual changesets are
+      // not scoped to linked-feature environments), and a caller who may
+      // update the experiment's analysis but may not run experiments.
+      const liveExperiment = { ...experiment, hasVisualChangesets: true };
+      beforeEach(() => {
+        updateReqContext({
+          org: { ...org, settings: { environments: [{ id: "production" }] } },
+          permissions: {
+            canUpdateExperiment: () => true,
+            canRunExperiment: () => false,
+            throwPermissionError: () => {
+              throw new PermissionError("permission denied");
+            },
+          },
+        });
+        (getExperimentById as jest.Mock).mockResolvedValue(liveExperiment);
+        (updateExperiment as jest.Mock).mockImplementation(
+          ({ experiment: exp, changes }) => ({ ...exp, ...changes }),
+        );
+      });
+
+      it("refuses a phases change without run permission", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({
+            phases: [{ name: "Main", dateStarted: "2026-02-01T00:00:00.000Z" }],
+          })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(403);
+        expect(updateExperiment).not.toHaveBeenCalled();
+      });
+
+      it("refuses a bucketing change without run permission", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ bucketVersion: 2, hashAttribute: "device_id" })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(403);
+        expect(updateExperiment).not.toHaveBeenCalled();
+      });
+
+      it("allows an analysis-only change without run permission", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ description: "Updated description" })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(200);
+      });
+
+      it("asks for run permission whenever a payload field is sent, as the dashboard route does", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ name: liveExperiment.name, description: "Updated" })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(403);
+      });
+
+      // A scheduled end that stops the experiment or ships a variation is a
+      // deferred status change; only a notify-only end stays analysis-level.
+      const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      const stopSchedule = {
+        stopAt: future,
+        scheduledStopPlan: { mode: "stop" },
+      };
+      const notifySchedule = {
+        stopAt: future,
+        scheduledStopPlan: { mode: "notify" },
+      };
+
+      it("refuses scheduling a stop through the update route without run permission", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ statusUpdateSchedule: stopSchedule })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(403);
+        expect(updateExperiment).not.toHaveBeenCalled();
+      });
+
+      it("refuses scheduling a stop through PUT /schedule without run permission", async () => {
+        const res = await request(app)
+          .put("/api/v1/experiments/exp_123/schedule")
+          .send(stopSchedule)
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(403);
+        expect(updateExperiment).not.toHaveBeenCalled();
+      });
+
+      it("refuses clearing a pending scheduled stop through PUT /schedule without run permission", async () => {
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...liveExperiment,
+          statusUpdateSchedule: {
+            stopAt: new Date(future),
+            scheduledStopPlan: { mode: "stop" },
+          },
+          nextScheduledStatusUpdate: { type: "stop", date: new Date(future) },
+        });
+        const res = await request(app)
+          .put("/api/v1/experiments/exp_123/schedule")
+          .send({})
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(403);
+        expect(updateExperiment).not.toHaveBeenCalled();
+      });
+
+      it("allows clearing a stop plan that is no longer pending without run permission", async () => {
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...liveExperiment,
+          statusUpdateSchedule: {
+            stopAt: new Date(Date.now() - 60 * 60 * 1000),
+            scheduledStopPlan: { mode: "stop" },
+          },
+          nextScheduledStatusUpdate: null,
+        });
+        const res = await request(app)
+          .put("/api/v1/experiments/exp_123/schedule")
+          .send({})
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(200);
+      });
+
+      it("refuses scheduling a start through PUT /schedule without run permission", async () => {
+        const res = await request(app)
+          .put("/api/v1/experiments/exp_123/schedule")
+          .send({ startAt: future })
+          .set("Authorization", "Bearer foo");
+        expect(res.status).toBe(403);
+      });
+
+      it("refuses launching a draft whose rule is still in a feature draft", async () => {
+        // Live nowhere yet: the only reach is the pending draft the start publishes.
+        updateReqContext({
+          permissions: {
+            canUpdateExperiment: () => true,
+            canRunExperiment: () => false,
+            // Loading the linked feature from Mongo needs the read check too.
+            canReadTargetingScopedResource: () => true,
+            throwPermissionError: () => {
+              throw new PermissionError("permission denied");
+            },
+          },
+        });
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...experiment,
+          status: "draft",
+          hasVisualChangesets: false,
+          linkedFeatures: ["feat_launch"],
+          pendingFeatureDrafts: [
+            { featureId: "feat_launch", revisionVersion: 2 },
+          ],
+        });
+        const features = mongoose.connection.collection("features");
+        const revisions = mongoose.connection.collection("featurerevisions");
+        await features.insertOne({
+          id: "feat_launch",
+          organization: "org_1",
+          project: "proj_1",
+          valueType: "boolean",
+          defaultValue: "false",
+          version: 1,
+          rules: [],
+          environmentSettings: { production: { enabled: true } },
+          dateCreated: new Date(),
+          dateUpdated: new Date(),
+        });
+        await revisions.insertOne({
+          id: "frev_feat_launch_2",
+          organization: "org_1",
+          featureId: "feat_launch",
+          version: 2,
+          baseVersion: 1,
+          status: "draft",
+          createdBy: { type: "api_key", apiKey: "k" },
+          defaultValue: "false",
+          rules: [
+            {
+              type: "experiment-ref",
+              id: "fr_launch",
+              experimentId: "exp_123",
+              enabled: true,
+              allEnvironments: true,
+              variations: [],
+            },
+          ],
+          dateCreated: new Date(),
+          dateUpdated: new Date(),
+        });
+        try {
+          const res = await request(app)
+            .post("/api/v1/experiments/exp_123")
+            .send({ status: "running" })
+            .set("Authorization", "Bearer foo");
+          expect(res.body.message).toMatch(/permission/i);
+          expect(res.status).toBe(403);
+          expect(updateExperiment).not.toHaveBeenCalled();
+        } finally {
+          await features.deleteMany({ organization: "org_1" });
+          await revisions.deleteMany({ organization: "org_1" });
+        }
+      });
+
+      it("allows a notify-only schedule without run permission on both routes", async () => {
+        const viaUpdate = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ statusUpdateSchedule: notifySchedule })
+          .set("Authorization", "Bearer foo");
+        expect(viaUpdate.status).toBe(200);
+
+        const viaSchedule = await request(app)
+          .put("/api/v1/experiments/exp_123/schedule")
+          .send(notifySchedule)
+          .set("Authorization", "Bearer foo");
+        expect(viaSchedule.status).toBe(200);
+      });
+
+      it("allows scheduling a stop with run permission", async () => {
+        updateReqContext({
+          permissions: {
+            canUpdateExperiment: () => true,
+            canRunExperiment: () => true,
+          },
+        });
+        const res = await request(app)
+          .put("/api/v1/experiments/exp_123/schedule")
+          .send(stopSchedule)
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(200);
+        expect(updateExperiment).toHaveBeenCalledWith(
+          expect.objectContaining({
+            changes: expect.objectContaining({
+              nextScheduledStatusUpdate: expect.objectContaining({
+                type: "stop",
+              }),
+            }),
+          }),
+        );
+      });
+    });
+
+    it("keeps the stored variation ids when the body omits them", async () => {
+      const stored = {
+        ...experiment,
+        variations: [
+          { id: "var_a", key: "0", name: "Control" },
+          { id: "var_b", key: "1", name: "Variation" },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(stored);
+      (updateExperiment as jest.Mock).mockResolvedValue(stored);
+      // Reordered, renamed, and one id given: the omitted id follows its key.
+      await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          variations: [
+            { id: "var_b", key: "1", name: "Variation" },
+            { key: "0", name: "Control renamed" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+      expect(assertLivePayloadChangeAllowed).toHaveBeenCalledWith(
+        expect.anything(),
+        stored,
+        expect.objectContaining({
+          variations: [
+            expect.objectContaining({ id: "var_b", key: "1" }),
+            expect.objectContaining({ id: "var_a", name: "Control renamed" }),
+          ],
+        }),
+      );
+    });
+
+    it("refuses to change what a running, live experiment serves", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      jest
+        .mocked(assertLivePayloadChangeAllowed)
+        .mockRejectedValueOnce(
+          new BadRequestError(
+            "Cannot change: [variation IDs] while the experiment is running and live in the SDK payload.",
+          ),
+        );
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          variations: [
+            { id: "0", key: "0", name: "Control" },
+            { id: "new", key: "1", name: "Variation" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+      expect(res.body.message).toMatch(/Cannot change: \[variation IDs\]/);
+      expect(res.status).toBe(400);
+      expect(assertLivePayloadChangeAllowed).toHaveBeenCalledWith(
+        expect.anything(),
+        experiment,
+        expect.objectContaining({
+          variations: expect.arrayContaining([
+            expect.objectContaining({ id: "new" }),
+          ]),
+        }),
+      );
+      expect(updateExperiment).not.toHaveBeenCalled();
+    });
+
+    it("allows update when required custom fields are missing and payload omits customFields", async () => {
+      const getCustomFieldsBySectionAndProject = jest.fn().mockResolvedValue([
+        {
+          id: "cfd_team",
+          name: "Owning Team",
+          type: "enum",
+          required: true,
+          values: "growth,platform",
+          section: "experiment",
+          dateCreated: new Date("2026-01-01"),
+          dateUpdated: new Date("2026-01-01"),
+        },
+      ]);
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject,
+          },
+        },
+      });
+
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        customFields: {},
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Updated Experiment Name",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(updateExperiment).toHaveBeenCalled();
+      expect(getCustomFieldsBySectionAndProject).not.toHaveBeenCalled();
+    });
+
+    it("allows update when customFields payload is unchanged", async () => {
+      const getCustomFieldsBySectionAndProject = jest.fn().mockResolvedValue([
+        {
+          id: "cfd_team",
+          name: "Owning Team",
+          type: "enum",
+          required: true,
+          values: "growth,platform",
+          section: "experiment",
+          dateCreated: new Date("2026-01-01"),
+          dateUpdated: new Date("2026-01-01"),
+        },
+      ]);
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject,
+          },
+        },
+      });
+
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        customFields: {},
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Updated Experiment Name",
+          customFields: {},
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(updateExperiment).toHaveBeenCalled();
+      expect(getCustomFieldsBySectionAndProject).not.toHaveBeenCalled();
+    });
+
+    it("rejects update when customFields are cleared from a non-empty object", async () => {
+      const getCustomFieldsBySectionAndProject = jest.fn().mockResolvedValue([
+        {
+          id: "cfd_team",
+          name: "Owning Team",
+          type: "enum",
+          required: true,
+          values: "growth,platform",
+          section: "experiment",
+          dateCreated: new Date("2026-01-01"),
+          dateUpdated: new Date("2026-01-01"),
+        },
+      ]);
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject,
+          },
+        },
+      });
+
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        customFields: {
+          cfd_team: "growth",
+        },
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Updated Experiment Name",
+          customFields: {},
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(
+        'Custom field "Owning Team" is required.',
+      );
+      expect(updateExperiment).not.toHaveBeenCalled();
+      expect(getCustomFieldsBySectionAndProject).toHaveBeenCalled();
+    });
+
+    it("allows update when project payload is unchanged", async () => {
+      const getCustomFieldsBySectionAndProject = jest.fn().mockResolvedValue([
+        {
+          id: "cfd_team",
+          name: "Owning Team",
+          type: "enum",
+          required: true,
+          values: "growth,platform",
+          section: "experiment",
+          dateCreated: new Date("2026-01-01"),
+          dateUpdated: new Date("2026-01-01"),
+        },
+      ]);
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject,
+          },
+        },
+      });
+
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        customFields: {},
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Updated Experiment Name",
+          project: "proj_1",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(updateExperiment).toHaveBeenCalled();
+      expect(getCustomFieldsBySectionAndProject).not.toHaveBeenCalled();
+    });
+
+    describe("assignment query selection", () => {
+      const withSelection = {
+        ...experiment,
+        datasource: "ds_123",
+        exposureQueryId: "eq_single",
+        exposureQueryIdentifierType: "company_id",
+      };
+      beforeEach(() => {
+        (getExperimentById as jest.Mock).mockResolvedValue(withSelection);
+        (updateExperiment as jest.Mock).mockImplementation(
+          ({ experiment, changes }) => ({ ...experiment, ...changes }),
+        );
+        (getDataSourceById as jest.Mock).mockResolvedValue({
+          id: "ds_123",
+          type: "postgres",
+          settings: {
+            queries: {
+              exposure: [
+                {
+                  id: "eq_single",
+                  name: "Single",
+                  userIdType: "user_id",
+                  userIdTypes: ["user_id"],
+                },
+                {
+                  id: "eq_multi",
+                  name: "Multi",
+                  userIdType: "anonymous_id",
+                  userIdTypes: ["anonymous_id", "user_id"],
+                },
+                {
+                  id: "eq_dropped",
+                  name: "Dropped",
+                  userIdType: "user_id",
+                  userIdTypes: ["anonymous_id"],
+                },
+              ],
+            },
+          },
+        });
+      });
+
+      it("moves to another data source along with one of its queries", async () => {
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...withSelection,
+          status: "draft",
+        });
+        (getDataSourceById as jest.Mock).mockImplementation(
+          async (_context, id: string) => ({
+            id,
+            type: "postgres",
+            settings: {
+              queries: {
+                exposure: [
+                  {
+                    id: "eq_other",
+                    name: "Other",
+                    userIdType: "user_id",
+                    userIdTypes: ["user_id"],
+                  },
+                ],
+              },
+            },
+          }),
+        );
+        const move = (body: object) =>
+          request(app)
+            .post("/api/v1/experiments/exp_123")
+            .send(body)
+            .set("Authorization", "Bearer foo");
+
+        expect((await move({ datasourceId: "ds_other" })).status).toBe(400);
+        const moved = await move({
+          datasourceId: "ds_other",
+          assignmentQueryId: "eq_other",
+        });
+        expect(moved.status).toBe(200);
+        expect(
+          (updateExperiment as jest.Mock).mock.calls[0][0].changes,
+        ).toMatchObject({
+          datasource: "ds_other",
+          exposureQueryId: "eq_other",
+        });
+
+        // A running experiment can move too, dropping the old source's settings.
+        updateReqContext({
+          models: {
+            segments: {
+              getById: jest
+                .fn()
+                .mockResolvedValue({ id: "seg_old", datasource: "ds_123" }),
+            },
+          },
+        });
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...withSelection,
+          segment: "seg_old",
+          precomputedUnitDimensionIds: ["dim_old"],
+        });
+        const running = await move({
+          datasourceId: "ds_other",
+          assignmentQueryId: "eq_other",
+        });
+        expect(running.status).toBe(200);
+        expect(
+          (updateExperiment as jest.Mock).mock.calls.at(-1)[0].changes,
+        ).toMatchObject({ segment: "", precomputedUnitDimensionIds: [] });
+      });
+
+      it("accepts re-sending a selection whose query no longer declares it", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({
+            assignmentQuery: { id: "eq_single", identifierType: "company_id" },
+          })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(200);
+      });
+
+      it("clears the old identifier when repointing by flat id to an implicit query", async () => {
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...withSelection,
+          exposureQueryId: "eq_multi",
+          exposureQueryIdentifierType: "user_id",
+        });
+
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ assignmentQueryId: "eq_single" })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(200);
+        const { changes } = (updateExperiment as jest.Mock).mock.calls[0][0];
+        expect(changes).toMatchObject({ exposureQueryId: "eq_single" });
+        expect(changes).toHaveProperty(
+          "exposureQueryIdentifierType",
+          undefined,
+        );
+      });
+
+      it("rejects repointing by flat id to a query that declares several identifier types", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ assignmentQueryId: "eq_multi" })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toContain(
+          "declares several identifier types (anonymous_id, user_id)",
+        );
+        expect(updateExperiment).not.toHaveBeenCalled();
+      });
+
+      it("rejects repointing by flat id to a query that dropped its legacy identifier", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ assignmentQueryId: "eq_dropped" })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toContain(
+          'no longer declares its default identifier type "user_id"',
+        );
+      });
+
+      it("keeps an implicit experiment implicit when the update echoes its resolved identifier", async () => {
+        (getExperimentById as jest.Mock).mockResolvedValue({
+          ...withSelection,
+          exposureQueryId: "eq_multi",
+          exposureQueryIdentifierType: undefined,
+        });
+
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({
+            assignmentQuery: { id: "eq_multi", identifierType: "anonymous_id" },
+          })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(200);
+        expect(
+          (updateExperiment as jest.Mock).mock.calls[0][0].changes,
+        ).not.toHaveProperty("exposureQueryIdentifierType");
+      });
+
+      it("rejects the grouped field without an identifier on an ambiguous query", async () => {
+        const res = await request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({ assignmentQuery: { id: "eq_multi" } })
+          .set("Authorization", "Bearer foo");
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toContain(
+          "declares several identifier types (anonymous_id, user_id)",
+        );
+      });
+    });
+
+    it("revalidates and rejects when changing project to one with required custom fields", async () => {
+      const getCustomFieldsBySectionAndProject = jest
+        .fn()
+        .mockImplementation(({ project }) => {
+          if (project === "proj_2") {
+            return Promise.resolve([
+              {
+                id: "cfd_team",
+                name: "Owning Team",
+                type: "enum",
+                required: true,
+                values: "growth,platform",
+                section: "experiment",
+                dateCreated: new Date("2026-01-01"),
+                dateUpdated: new Date("2026-01-01"),
+              },
+            ]);
+          }
+          return Promise.resolve([]);
+        });
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject,
+          },
+        },
+      });
+
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        project: "proj_1",
+        customFields: {},
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Updated Experiment Name",
+          project: "proj_2",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(
+        'Custom field "Owning Team" is required.',
+      );
+      expect(updateExperiment).not.toHaveBeenCalled();
+      expect(getCustomFieldsBySectionAndProject).toHaveBeenCalled();
+    });
+
+    it("revalidates and rejects when changing project and customFields payload is changed", async () => {
+      const getCustomFieldsBySectionAndProject = jest
+        .fn()
+        .mockImplementation(({ project }) => {
+          if (project === "proj_2") {
+            return Promise.resolve([
+              {
+                id: "cfd_team",
+                name: "Owning Team",
+                type: "enum",
+                required: true,
+                values: "growth,platform",
+                section: "experiment",
+                dateCreated: new Date("2026-01-01"),
+                dateUpdated: new Date("2026-01-01"),
+              },
+            ]);
+          }
+          return Promise.resolve([]);
+        });
+      updateReqContext({
+        models: {
+          customFields: {
+            getCustomFieldsBySectionAndProject,
+          },
+        },
+      });
+
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        project: "proj_1",
+        customFields: {
+          cfd_team: "growth",
+        },
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Updated Experiment Name",
+          project: "proj_2",
+          customFields: {},
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(
+        'Custom field "Owning Team" is required.',
+      );
+      expect(updateExperiment).not.toHaveBeenCalled();
+      expect(getCustomFieldsBySectionAndProject).toHaveBeenCalled();
+    });
+
+    it("resolves email to userId when updating an experiment", async () => {
+      const testUser = { id: "u_user1", email: "user@example.com" };
+      updateReqContext({
+        org: { ...org, members: [{ id: testUser.id }] },
+        getUserByEmail: jest.fn().mockResolvedValue(testUser),
+      });
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockResolvedValue({
+        ...experiment,
+        owner: testUser.id,
+      });
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({ owner: testUser.email })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(updateExperiment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          changes: expect.objectContaining({ owner: testUser.id }),
+        }),
+      );
+    });
+
+    it("returns 404 when experiment not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(null);
+
+      const updatePayload = {
+        name: "Updated Name",
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/nonexistent")
+        .send(updatePayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(404);
+      expect(res.body).toHaveProperty("message");
+      expect(res.body.message).toContain("not found");
+    });
+
+    it("allows duplicate trackingKey on update when bypassDuplicateKeyCheck is true", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockResolvedValue({
+        ...experiment,
+        trackingKey: "existing_key",
+      });
+
+      const updatePayload = {
+        trackingKey: "existing_key",
+        bypassDuplicateKeyCheck: true,
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send(updatePayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(getExperimentByTrackingKey).toHaveBeenCalledTimes(0);
+    });
+
+    it("rejects duplicate trackingKey on update when requireUniqueExperimentTrackingKeys is enabled, even with bypassDuplicateKeyCheck", async () => {
+      const existingExperimentWithDifferentKey = {
+        ...experiment,
+        trackingKey: "original_key",
+      };
+      const anotherExperiment = {
+        ...experiment,
+        id: "exp_456",
+        trackingKey: "existing_key",
+      };
+
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        existingExperimentWithDifferentKey,
+      );
+      (getExperimentByTrackingKey as jest.Mock).mockResolvedValue(
+        anotherExperiment,
+      );
+
+      const orgWithSetting = {
+        ...org,
+        settings: { requireUniqueExperimentTrackingKeys: true },
+      };
+
+      updateReqContext({
+        org: orgWithSetting,
+        organization: orgWithSetting,
+        models: {
+          projects: {
+            ensureProjectsExist: jest.fn().mockResolvedValue(undefined),
+            getById: jest.fn().mockResolvedValue(null),
+            getByIds: jest.fn().mockResolvedValue([]),
+          },
+          metricGroups: {
+            getAll: jest.fn().mockResolvedValue([]),
+          },
+          customFields: {
+            getCustomFieldsBySectionAndProject: jest.fn().mockResolvedValue([]),
+          },
+        },
+        permissions: {
+          canUpdateExperiment: () => true,
+        },
+      });
+
+      const updatePayload = {
+        trackingKey: "existing_key",
+        bypassDuplicateKeyCheck: true,
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send(updatePayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("message");
+      expect(res.body.message).toContain(
+        "requires unique experiment tracking keys",
+      );
+    });
+
+    it("rejects a changed trackingKey that doesn't match experimentKeyRegexValidator", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        trackingKey: "original_key",
+      });
+      const orgWithSetting = {
+        ...org,
+        settings: { experimentKeyRegexValidator: "^exp-" },
+      };
+      updateReqContext({
+        org: orgWithSetting,
+        organization: orgWithSetting,
+        permissions: { canUpdateExperiment: () => true },
+      });
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({ trackingKey: "bad_key" })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("must match the regex validator");
+      expect(res.body.code).toBe("invalid_tracking_key");
+    });
+
+    it("updates experiment variations with signed URLs", async () => {
+      updateReqContext({
+        org,
+        models: {
+          projects: {
+            ensureProjectsExist: jest.fn().mockResolvedValue(undefined),
+            getById: jest.fn().mockResolvedValue(null),
+          },
+          factMetrics: {
+            getAll: jest.fn().mockResolvedValue([]),
+          },
+        },
+        permissions: {
+          canUpdateExperiment: () => true,
+        },
+      });
+
+      (getDataSourceById as jest.Mock).mockResolvedValue({
+        id: "ds_123",
+        type: "postgres",
+        settings: {
+          queries: {
+            exposure: [
+              {
+                id: "user_id",
+                name: "User ID",
+                userIdType: "user_id",
+                userIdTypes: ["user_id"],
+              },
+            ],
+          },
+        },
+      });
+
+      const updatedExperiment = {
+        ...experiment,
+        variations: [
+          {
+            id: "0",
+            key: "control",
+            name: "Updated Control",
+            description: "",
+            screenshots: [
+              { path: "new_screenshot1.png" },
+              { path: "new_screenshot2.png" },
+            ],
+          },
+          {
+            id: "1",
+            key: "variation",
+            name: "Variation",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockResolvedValue(updatedExperiment);
+
+      const updatePayload = {
+        variations: [
+          {
+            variationId: "0",
+            key: "control",
+            name: "Updated Control",
+            description: "",
+            screenshots: [
+              { path: "new_screenshot1.png" },
+              { path: "new_screenshot2.png" },
+            ],
+          },
+          {
+            variationId: "1",
+            key: "variation",
+            name: "Variation",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send(updatePayload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("experiment");
+      expect(res.body.experiment.variations[0].screenshots).toEqual([
+        "https://signed.example.com/new_screenshot1.png",
+        "https://signed.example.com/new_screenshot2.png",
+      ]);
+    });
+
+    it("syncs phase variation envelopes when updating top-level variations only", async () => {
+      const experimentWithPhases = {
+        ...experiment,
+        variations: [
+          {
+            id: "v0",
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            id: "v1",
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "seed_123",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "{}",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: {
+              enabled: false,
+              name: "",
+              range: [0, 1],
+            },
+            variations: [
+              { id: "v1", status: "active" },
+              { id: "v0", status: "active" },
+            ],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithPhases);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const payload: UpdateExperimentApiPayload = {
+        variations: [
+          { id: "va", key: "control", name: "Control" },
+          { id: "vb", key: "treatment", name: "Treatment" },
+          { id: "vc", key: "new", name: "New" },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send(payload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes.phases[0].variations).toEqual([
+        { id: "va", status: "active" },
+        { id: "vb", status: "active" },
+        { id: "vc", status: "active" },
+      ]);
+    });
+
+    it("preserves phase variation envelopes on phases-only updates", async () => {
+      const experimentWithPhases = {
+        ...experiment,
+        variations: [
+          {
+            id: "v0",
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            id: "v1",
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "seed_123",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "{}",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: {
+              enabled: false,
+              name: "",
+              range: [0, 1],
+            },
+            variations: [
+              { id: "v1", status: "active" },
+              { id: "v0", status: "active" },
+            ],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithPhases);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const payload = {
+        phases: [
+          {
+            name: "Main",
+            dateStarted: "2026-02-01T00:00:00.000Z",
+          },
+        ],
+      };
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send(payload)
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes).not.toHaveProperty("variations");
+      expect(updateCall.changes.phases[0].variations).toEqual([
+        { id: "v1", status: "active" },
+        { id: "v0", status: "active" },
+      ]);
+    });
+
+    it("re-checks phase targeting only where it differs from the stored phases", async () => {
+      // Stored phase names a group that no longer exists.
+      const stale = {
+        condition: '{"id": {"$inGroup": "grp_gone"}}',
+        savedGroups: [{ match: "all", ids: ["grp_gone"] }],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-01T00:00:00.000Z"),
+            coverage: 1,
+            variationWeights: [1],
+            ...stale,
+          },
+        ],
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+      const update = (targeting: Record<string, unknown>) =>
+        request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({
+            phases: [
+              {
+                name: "Main",
+                dateStarted: "2026-01-01T00:00:00.000Z",
+                ...targeting,
+              },
+            ],
+          })
+          .set("Authorization", "Bearer foo");
+
+      const echo = await update(stale);
+      expect(echo.body.message).toBeUndefined();
+      expect(echo.status).toBe(200);
+
+      const changed = await update({
+        ...stale,
+        savedGroups: [{ match: "all", ids: ["grp_gone", "grp_other"] }],
+      });
+      expect(changed.body.message).toMatch(/grp_gone/);
+      expect(changed.status).toBe(404);
+    });
+
+    it("honors the GET-response phase field names on a round-trip update", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        variations: [
+          { id: "0", key: "control", name: "Control", screenshots: [] },
+          { id: "1", key: "treatment", name: "Treatment", screenshots: [] },
+        ],
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+
+      // Simulate echoing a GET response back: targeting/splits arrive under the
+      // response field names (targetingCondition / trafficSplit /
+      // reasonForStopping), which the update must honor.
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-01-01T00:00:00.000Z",
+              targetingCondition: '{"path":{"$in":["/checkout"]}}',
+              trafficSplit: [
+                { variationId: "0", weight: 0.9 },
+                { variationId: "1", weight: 0.1 },
+              ],
+              reasonForStopping: "ramp down",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      const phase = updateCall.changes.phases[0];
+      expect(phase.condition).toBe('{"path":{"$in":["/checkout"]}}');
+      expect(phase.variationWeights).toEqual([0.9, 0.1]);
+      expect(phase.reason).toBe("ramp down");
+    });
+
+    it("maps trafficSplit weights by variationId, not array position", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        variations: [
+          { id: "0", key: "control", name: "Control", screenshots: [] },
+          { id: "1", key: "treatment", name: "Treatment", screenshots: [] },
+        ],
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+
+      // trafficSplit reordered relative to the variations: weights must still
+      // land on the right variation (0 -> 0.9, 1 -> 0.1), not by position.
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-01-01T00:00:00.000Z",
+              trafficSplit: [
+                { variationId: "1", weight: 0.1 },
+                { variationId: "0", weight: 0.9 },
+              ],
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const phase = (updateExperiment as jest.Mock).mock.calls[0][0].changes
+        .phases[0];
+      expect(phase.variationWeights).toEqual([0.9, 0.1]);
+    });
+
+    it("honors variationId as an alias for id so variations round-trip", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+
+      // Echoing GET variations back: they arrive with variationId, not id.
+      // Without the alias, id would be regenerated and identity would churn.
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          variations: [
+            { variationId: "v0", key: "control", name: "Control" },
+            { variationId: "v1", key: "treatment", name: "Treatment" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const changes = (updateExperiment as jest.Mock).mock.calls[0][0].changes;
+      expect(changes.variations.map((v) => v.id)).toEqual(["v0", "v1"]);
+    });
+
+    it("prefers the POST-only phase fields when both they and their aliases are set", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        variations: [
+          ...experiment.variations,
+          {
+            id: "1",
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-01-01T00:00:00.000Z",
+              condition: '{"id":"post"}',
+              targetingCondition: '{"id":"response"}',
+              variationWeights: [0.7, 0.3],
+              trafficSplit: [
+                { variationId: "0", weight: 0.9 },
+                { variationId: "1", weight: 0.1 },
+              ],
+              reason: "post reason",
+              reasonForStopping: "response reason",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const phase = (updateExperiment as jest.Mock).mock.calls[0][0].changes
+        .phases[0];
+      expect(phase.condition).toBe('{"id":"post"}');
+      expect(phase.variationWeights).toEqual([0.7, 0.3]);
+      expect(phase.reason).toBe("post reason");
+    });
+
+    it("force-syncs phase variations in mixed phases plus top-level variations updates", async () => {
+      const experimentWithPhases = {
+        ...experiment,
+        variations: [
+          {
+            id: "v0",
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            id: "v1",
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "seed_123",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "{}",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: {
+              enabled: false,
+              name: "",
+              range: [0, 1],
+            },
+            variations: [
+              { id: "v1", status: "active" },
+              { id: "v0", status: "active" },
+            ],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithPhases);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          variations: [
+            { id: "vb", key: "treatment", name: "Treatment" },
+            { id: "va", key: "control", name: "Control" },
+          ],
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-02-01T00:00:00.000Z",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes.phases[0].variations).toEqual([
+        { id: "vb", status: "active" },
+        { id: "va", status: "active" },
+      ]);
+    });
+
+    it("does not include phases in changes when updating non-phase fields", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          name: "Renamed Experiment",
+          description: "Updated description",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes).not.toHaveProperty("phases");
+    });
+
+    it("preserves phase variations when phases are provided without phase-level variations", async () => {
+      const experimentWithPhases = {
+        ...experiment,
+        variations: [
+          {
+            id: "v0",
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            id: "v1",
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "seed_123",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "{}",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: {
+              enabled: false,
+              name: "",
+              range: [0, 1],
+            },
+            variations: [
+              { id: "v1", status: "active" },
+              { id: "v0", status: "active" },
+            ],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithPhases);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-02-01T00:00:00.000Z",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes.phases[0].variations).toEqual([
+        { id: "v1", status: "active" },
+        { id: "v0", status: "active" },
+      ]);
+    });
+
+    it("returns 400 for invalid phase targeting condition", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-02-01T00:00:00.000Z",
+              condition: "{",
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("Invalid targeting condition");
+      expect(updateExperiment).not.toHaveBeenCalled();
+    });
+
+    it("returns 400 for invalid phase prerequisite condition", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          phases: [
+            {
+              name: "Main",
+              dateStarted: "2026-02-01T00:00:00.000Z",
+              condition: "{}",
+              prerequisites: [{ id: "feature_123", condition: "{" }],
+            },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain(
+        'Invalid condition on prerequisite "feature_123"',
+      );
+      expect(updateExperiment).not.toHaveBeenCalled();
+    });
+
+    it("checks $savedGroups in phase targeting against the Saved Groups it names", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+      updateReqContext({
+        models: {
+          savedGroups: {
+            getAllWithoutValues: jest.fn(async (ids: string[]) =>
+              ids.includes("grp_vip")
+                ? [{ id: "grp_vip", type: "condition", condition: "{}" }]
+                : [],
+            ),
+          },
+        },
+      });
+      const updatePhase = (phase: object) =>
+        request(app)
+          .post("/api/v1/experiments/exp_123")
+          .send({
+            phases: [
+              {
+                name: "Main",
+                dateStarted: "2026-02-01T00:00:00.000Z",
+                ...phase,
+              },
+            ],
+          })
+          .set("Authorization", "Bearer foo");
+
+      expect(
+        (await updatePhase({ condition: '{"$savedGroups":["grp_vip"]}' }))
+          .status,
+      ).toBe(200);
+
+      const missing = await updatePhase({
+        condition: '{"$savedGroups":["grp_gone"]}',
+      });
+      expect(missing.status).toBe(400);
+      expect(missing.body.message).toBe(
+        'Invalid targeting condition: Saved Group "grp_gone" does not exist',
+      );
+    });
+
+    it("ends the latest phase when stopping by update, as the app does", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue({
+        ...experiment,
+        status: "running",
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-01"),
+            reason: "",
+            coverage: 1,
+            condition: "",
+            variationWeights: [1],
+            variations: [{ id: "0", status: "active" }],
+          },
+        ],
+      });
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({ ...experiment, ...changes }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({ status: "stopped" })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const { changes } = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(changes.phases[0].dateEnded).toEqual(expect.any(Date));
+    });
+
+    it("syncs only the latest phase when updating top-level variations without phases", async () => {
+      const experimentWithMultiplePhases = {
+        ...experiment,
+        variations: [
+          {
+            id: "v0",
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [],
+          },
+          {
+            id: "v1",
+            key: "treatment",
+            name: "Treatment",
+            description: "",
+            screenshots: [],
+          },
+        ],
+        phases: [
+          {
+            name: "Ramp",
+            dateStarted: new Date("2026-01-01"),
+            dateEnded: new Date("2026-01-10"),
+            reason: "",
+            seed: "seed_old",
+            coverage: 0.5,
+            variationWeights: [0.5, 0.5],
+            condition: "{}",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: {
+              enabled: false,
+              name: "",
+              range: [0, 1],
+            },
+            variations: [
+              { id: "v1", status: "active" },
+              { id: "v0", status: "active" },
+            ],
+          },
+          {
+            name: "Main",
+            dateStarted: new Date("2026-01-10"),
+            dateEnded: null,
+            reason: "",
+            seed: "seed_main",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "{}",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: {
+              enabled: false,
+              name: "",
+              range: [0, 1],
+            },
+            variations: [
+              { id: "v1", status: "active" },
+              { id: "v0", status: "active" },
+            ],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithMultiplePhases,
+      );
+      (updateExperiment as jest.Mock).mockImplementation(
+        ({ experiment, changes }) => ({
+          ...experiment,
+          ...changes,
+        }),
+      );
+
+      const res = await request(app)
+        .post("/api/v1/experiments/exp_123")
+        .send({
+          variations: [
+            { id: "va", key: "control", name: "Control" },
+            { id: "vb", key: "treatment", name: "Treatment" },
+            { id: "vc", key: "new", name: "New" },
+          ],
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes.phases[0].variations).toEqual([
+        { id: "v1", status: "active" },
+        { id: "v0", status: "active" },
+      ]);
+      expect(updateCall.changes.phases[1].variations).toEqual([
+        { id: "va", status: "active" },
+        { id: "vb", status: "active" },
+        { id: "vc", status: "active" },
+      ]);
+      expect(updateCall.changes.phases[1].variationWeights).toHaveLength(3);
+    });
+  });
+
+  describe("GET /api/v1/experiments/:id/results", () => {
+    it("returns experiment results", async () => {
+      updateReqContext({
+        org,
+        permissions: {
+          canViewExperiment: () => true,
+        },
+      });
+
+      const experimentWithPhases = {
+        ...experiment,
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2024-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "test-seed",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: { enabled: false },
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithPhases);
+      (getLatestSuccessfulSnapshot as jest.Mock).mockResolvedValue({
+        id: "snap_123",
+        organization: "org_1",
+        experiment: "exp_123",
+        phase: 0,
+        dimension: null,
+        dateCreated: new Date(),
+        runStarted: new Date(),
+        queries: [],
+        unknownVariations: [],
+        multipleExposures: 0,
+        hasCorrectedStats: false,
+        results: [],
+        settings: {
+          manual: false,
+          activationMetric: null,
+          queryFilter: "",
+          segment: "",
+          skipPartialData: false,
+          attributionModel: "firstExposure",
+          experimentId: "exp_123",
+          statsEngine: "bayesian",
+          regressionAdjustmentEnabled: false,
+          sequentialTestingEnabled: false,
+          sequentialTestingTuningParameter: 5000,
+          pValueThreshold: 0.05,
+          pValueCorrection: null,
+          differenceType: "relative",
+        },
+      });
+
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("result");
+    });
+
+    it("includes metricName and variationName for each metric/variation pair", async () => {
+      updateReqContext({
+        org,
+        permissions: {
+          canViewExperiment: () => true,
+        },
+      });
+
+      const experimentWithResults = {
+        ...experiment,
+        variations: [
+          {
+            id: "0",
+            key: "control",
+            name: "Control Variation",
+            description: "",
+            screenshots: [],
+          },
+          {
+            id: "1",
+            key: "treatment",
+            name: "Treatment Variation",
+            description: "",
+            screenshots: [],
+          },
+        ],
+        goalMetrics: ["met_1"],
+        phases: [
+          {
+            name: "Main",
+            dateStarted: new Date("2024-01-01"),
+            dateEnded: null,
+            reason: "",
+            seed: "test-seed",
+            coverage: 1,
+            variationWeights: [0.5, 0.5],
+            condition: "",
+            savedGroups: [],
+            prerequisites: [],
+            namespace: { enabled: false },
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(experimentWithResults);
+      (getMetricsByIds as jest.Mock).mockResolvedValue([
+        { id: "met_1", name: "Signups" },
+      ]);
+      (getLatestSuccessfulSnapshot as jest.Mock).mockResolvedValue({
+        id: "snap_123",
+        organization: "org_1",
+        experiment: "exp_123",
+        phase: 0,
+        dimension: null,
+        dateCreated: new Date(),
+        runStarted: new Date(),
+        queries: [],
+        unknownVariations: [],
+        multipleExposures: 0,
+        hasCorrectedStats: false,
+        analyses: [
+          {
+            settings: { statsEngine: "bayesian" },
+            results: [
+              {
+                name: "",
+                srm: 1,
+                variations: [
+                  { users: 100, metrics: { met_1: { value: 10, users: 100 } } },
+                  { users: 100, metrics: { met_1: { value: 12, users: 100 } } },
+                ],
+              },
+            ],
+          },
+        ],
+        settings: {
+          manual: false,
+          activationMetric: null,
+          queryFilter: "",
+          segment: "",
+          skipPartialData: false,
+          attributionModel: "firstExposure",
+          experimentId: "exp_123",
+          statsEngine: "bayesian",
+          regressionAdjustmentEnabled: false,
+          sequentialTestingEnabled: false,
+          sequentialTestingTuningParameter: 5000,
+          pValueThreshold: 0.05,
+          pValueCorrection: null,
+          differenceType: "relative",
+        },
+      });
+
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const metrics = res.body.result.results[0].metrics;
+      expect(metrics).toHaveLength(1);
+      expect(metrics[0].metricId).toBe("met_1");
+      expect(metrics[0].metricName).toBe("Signups");
+      expect(metrics[0].variations).toHaveLength(2);
+      expect(metrics[0].variations[0].variationId).toBe("0");
+      expect(metrics[0].variations[0].variationName).toBe("Control Variation");
+      expect(metrics[0].variations[1].variationId).toBe("1");
+      expect(metrics[0].variations[1].variationName).toBe(
+        "Treatment Variation",
+      );
+    });
+
+    it("returns 404 when experiment not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/nonexistent/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(404);
+      expect(res.body).toHaveProperty("message");
+    });
+
+    it("returns 400 when no results found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(experiment);
+      (getLatestSuccessfulSnapshot as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/exp_123/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("message");
+      expect(res.body.message).toContain("No results found");
+    });
+  });
+
+  describe("GET /api/v1/experiments/results", () => {
+    const phase = {
+      name: "Main",
+      dateStarted: new Date("2024-01-01"),
+      dateEnded: null,
+      reason: "",
+      seed: "test-seed",
+      coverage: 1,
+      variationWeights: [0.5, 0.5],
+      condition: "",
+      savedGroups: [],
+      prerequisites: [],
+      namespace: { enabled: false },
+    };
+
+    const experimentA = {
+      ...experiment,
+      id: "exp_a",
+      trackingKey: "exp_a",
+      phases: [phase],
+    };
+    const experimentB = {
+      ...experiment,
+      id: "exp_b",
+      trackingKey: "exp_b",
+      phases: [phase],
+    };
+
+    const snapshotFor = (experimentId: string) => ({
+      id: `snap_${experimentId}`,
+      organization: "org_1",
+      experiment: experimentId,
+      phase: 0,
+      dimension: null,
+      dateCreated: new Date(),
+      runStarted: new Date(),
+      queries: [],
+      unknownVariations: [],
+      multipleExposures: 0,
+      hasCorrectedStats: false,
+      results: [],
+      settings: {
+        manual: false,
+        activationMetric: null,
+        queryFilter: "",
+        segment: "",
+        skipPartialData: false,
+        attributionModel: "firstExposure",
+        experimentId,
+        statsEngine: "bayesian",
+        regressionAdjustmentEnabled: false,
+        sequentialTestingEnabled: false,
+        sequentialTestingTuningParameter: 5000,
+        pValueThreshold: 0.05,
+        pValueCorrection: null,
+        differenceType: "relative",
+      },
+    });
+
+    it("returns the latest snapshot for each experiment", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experimentA,
+        experimentB,
+      ]);
+      (getLatestSnapshotMultipleExperiments as jest.Mock).mockResolvedValue([
+        snapshotFor("exp_a"),
+        snapshotFor("exp_b"),
+      ]);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experimentResults).toHaveLength(2);
+      expect(res.body.experimentResults.map((r) => r.experimentId)).toEqual([
+        "exp_a",
+        "exp_b",
+      ]);
+      expect(res.body.total).toBe(2);
+      expect(res.body.count).toBe(2);
+      expect(res.body.hasMore).toBe(false);
+    });
+
+    it("silently skips experiments without a snapshot", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experimentA,
+        experimentB,
+      ]);
+      (getLatestSnapshotMultipleExperiments as jest.Mock).mockResolvedValue([
+        snapshotFor("exp_a"),
+      ]);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experimentResults).toHaveLength(1);
+      expect(res.body.experimentResults[0].experimentId).toBe("exp_a");
+      // `count` is overridden in the handler to match the response array
+      // length; `total` still reflects experiments matching the filter.
+      expect(res.body.total).toBe(2);
+      expect(res.body.count).toBe(1);
+    });
+
+    it("returns an empty page when no experiments match", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([]);
+      (getLatestSnapshotMultipleExperiments as jest.Mock).mockResolvedValue([]);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experimentResults).toEqual([]);
+      expect(res.body.total).toBe(0);
+      expect(res.body.count).toBe(0);
+    });
+
+    it("forwards projectId, datasourceId, status, and trackingKey filters", async () => {
+      (getAllExperiments as jest.Mock).mockResolvedValue([]);
+
+      await request(app)
+        .get(
+          "/api/v1/experiments/results?status=running&projectId=proj_1&datasourceId=ds_123&trackingKey=my-exp",
+        )
+        .set("Authorization", "Bearer foo");
+
+      expect(getAllExperiments).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          project: "proj_1",
+          datasourceId: "ds_123",
+          status: "running",
+          trackingKey: "my-exp",
+          includeArchived: true,
+        }),
+      );
+    });
+
+    it("excludes experiments without phases from the snapshot lookup", async () => {
+      const experimentWithoutPhases = {
+        ...experiment,
+        id: "exp_c",
+        trackingKey: "exp_c",
+        phases: [],
+      };
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experimentA,
+        experimentWithoutPhases,
+      ]);
+      (getLatestSnapshotMultipleExperiments as jest.Mock).mockResolvedValue([
+        snapshotFor("exp_a"),
+      ]);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/results")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      const phaseMap = (getLatestSnapshotMultipleExperiments as jest.Mock).mock
+        .calls[0][1] as Map<string, number>;
+      expect(phaseMap.has("exp_a")).toBe(true);
+      expect(phaseMap.has("exp_c")).toBe(false);
+    });
+
+    it("returns count:0 with hasMore:true when a one-item page lacks a snapshot", async () => {
+      // Two experiments matching the filter, page size 1, first one has no
+      // snapshot. Page 0 returns count:0 (nothing dropped through). hasMore is
+      // true so the consumer keeps paginating.
+      (getAllExperiments as jest.Mock).mockResolvedValue([
+        experimentA,
+        experimentB,
+      ]);
+      (getLatestSnapshotMultipleExperiments as jest.Mock).mockResolvedValue([]);
+
+      const res = await request(app)
+        .get("/api/v1/experiments/results?limit=1&offset=0")
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body.experimentResults).toEqual([]);
+      expect(res.body.count).toBe(0);
+      expect(res.body.total).toBe(2);
+      expect(res.body.hasMore).toBe(true);
+      expect(res.body.nextOffset).toBe(1);
+    });
+  });
+
+  describe("POST /api/v1/experiments/:id/variation/:variationId/screenshot/upload", () => {
+    const experimentWithVariationId = {
+      ...experiment,
+      variations: [
+        {
+          id: "var_test123",
+          key: "control",
+          name: "Control",
+          description: "",
+          screenshots: [],
+        },
+      ],
+    };
+
+    it("uploads variation screenshot successfully", async () => {
+      const { uploadFile } = await import("../../src/services/files");
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithVariationId,
+      );
+      (updateExperiment as jest.Mock).mockResolvedValue({
+        ...experimentWithVariationId,
+        variations: [
+          {
+            ...experimentWithVariationId.variations[0],
+            screenshots: [
+              {
+                path: "/upload/org_1/2026-03/img_test123.png",
+                description: "",
+              },
+            ],
+          },
+        ],
+      });
+
+      const res = await request(app)
+        .post(
+          "/api/v1/experiments/exp_123/variation/var_test123/screenshot/upload",
+        )
+        .send({
+          screenshot:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+          contentType: "image/png",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("screenshot");
+      expect(res.body.screenshot).toMatchObject({
+        path: "/upload/org_1/2026-03/img_test123.png",
+        description: "",
+      });
+      expect(uploadFile).toHaveBeenCalled();
+      expect(updateExperiment).toHaveBeenCalled();
+    });
+
+    it("returns 404 when experiment not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .post(
+          "/api/v1/experiments/nonexistent/variation/var_test123/screenshot/upload",
+        )
+        .send({
+          screenshot:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+          contentType: "image/png",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(404);
+      expect(res.body.message).toContain("Experiment not found");
+    });
+
+    it("returns 400 when variation not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithVariationId,
+      );
+
+      const res = await request(app)
+        .post(
+          "/api/v1/experiments/exp_123/variation/var_nonexistent/screenshot/upload",
+        )
+        .send({
+          screenshot:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+          contentType: "image/png",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("Unknown variation");
+    });
+  });
+
+  describe("DELETE /api/v1/experiments/:id/variation/:variationId/screenshot", () => {
+    const experimentWithScreenshots = {
+      ...experiment,
+      variations: [
+        {
+          id: "var_test123",
+          key: "control",
+          name: "Control",
+          description: "",
+          screenshots: [
+            { path: "/upload/org_1/2026-03/img1.png", description: "" },
+            { path: "/upload/org_1/2026-03/img2.png", description: "" },
+          ],
+        },
+      ],
+    };
+
+    it("deletes variation screenshot successfully", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithScreenshots,
+      );
+      (updateExperiment as jest.Mock).mockResolvedValue({
+        ...experimentWithScreenshots,
+        variations: [
+          {
+            ...experimentWithScreenshots.variations[0],
+            screenshots: [
+              { path: "/upload/org_1/2026-03/img2.png", description: "" },
+            ],
+          },
+        ],
+      });
+
+      const res = await request(app)
+        .delete("/api/v1/experiments/exp_123/variation/var_test123/screenshot")
+        .send({ path: "/upload/org_1/2026-03/img1.png" })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(updateExperiment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          experiment: experimentWithScreenshots,
+          changes: expect.objectContaining({
+            variations: expect.arrayContaining([
+              expect.objectContaining({
+                screenshots: [
+                  { path: "/upload/org_1/2026-03/img2.png", description: "" },
+                ],
+              }),
+            ]),
+          }),
+        }),
+      );
+    });
+
+    it("deletes screenshot when path has query params (signed S3 URL)", async () => {
+      const experimentWithS3Screenshot = {
+        ...experiment,
+        variations: [
+          {
+            id: "var_test123",
+            key: "control",
+            name: "Control",
+            description: "",
+            screenshots: [
+              {
+                path: "https://bucket.s3.amazonaws.com/org_1/2026-03/img1.png",
+                description: "",
+              },
+            ],
+          },
+        ],
+      };
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithS3Screenshot,
+      );
+      (updateExperiment as jest.Mock).mockResolvedValue({
+        ...experimentWithS3Screenshot,
+        variations: [
+          {
+            ...experimentWithS3Screenshot.variations[0],
+            screenshots: [],
+          },
+        ],
+      });
+
+      const res = await request(app)
+        .delete("/api/v1/experiments/exp_123/variation/var_test123/screenshot")
+        .send({
+          path: "https://bucket.s3.amazonaws.com/org_1/2026-03/img1.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=xxx",
+        })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(200);
+      expect(updateExperiment).toHaveBeenCalled();
+      const updateCall = (updateExperiment as jest.Mock).mock.calls[0][0];
+      expect(updateCall.changes.variations[0].screenshots).toHaveLength(0);
+    });
+
+    it("returns 400 when screenshot not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(
+        experimentWithScreenshots,
+      );
+
+      const res = await request(app)
+        .delete("/api/v1/experiments/exp_123/variation/var_test123/screenshot")
+        .send({ path: "/upload/org_1/2026-03/nonexistent.png" })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toContain("Screenshot not found");
+      expect(updateExperiment).not.toHaveBeenCalled();
+    });
+
+    it("returns 404 when experiment not found", async () => {
+      (getExperimentById as jest.Mock).mockResolvedValue(null);
+
+      const res = await request(app)
+        .delete(
+          "/api/v1/experiments/nonexistent/variation/var_test123/screenshot",
+        )
+        .send({ path: "/upload/org_1/2026-03/img1.png" })
+        .set("Authorization", "Bearer foo");
+
+      expect(res.status).toBe(404);
+      expect(res.body.message).toContain("Experiment not found");
+    });
+  });
+});

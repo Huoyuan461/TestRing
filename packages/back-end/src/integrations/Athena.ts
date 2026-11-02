@@ -1,0 +1,37 @@
+import { ExternalIdCallback, QueryResponse } from "shared/types/integrations";
+import { AthenaConnectionParams } from "shared/types/integrations/athena";
+import { decryptDataSourceParams } from "back-end/src/services/datasource";
+import {
+  cancelAthenaQuery,
+  getAthenaQueryStatus,
+  runAthenaQuery,
+} from "back-end/src/services/athena";
+import { ExternalQueryStatus } from "back-end/src/types/Integration";
+import SqlIntegration from "./SqlIntegration";
+
+export default class Athena extends SqlIntegration {
+  params!: AthenaConnectionParams;
+  requiresSchema = false;
+  setParams(encryptedParams: string) {
+    this.params =
+      decryptDataSourceParams<AthenaConnectionParams>(encryptedParams);
+  }
+  getPartitionColumnCondition(): string {
+    return "extra_info = 'partition key'";
+  }
+  runQuery(
+    sql: string,
+    setExternalId: ExternalIdCallback,
+  ): Promise<QueryResponse> {
+    return runAthenaQuery(this.params, sql, setExternalId);
+  }
+  async cancelQuery(externalId: string): Promise<void> {
+    await cancelAthenaQuery(this.params, externalId);
+  }
+  getExternalQueryStatus(externalId: string): Promise<ExternalQueryStatus> {
+    return getAthenaQueryStatus(this.params, externalId);
+  }
+  getDefaultDatabase() {
+    return this.params.catalog || "";
+  }
+}

@@ -1,0 +1,92 @@
+import { OpenApiRoute } from "back-end/src/util/handler";
+import { getSavedGroup } from "./getSavedGroup";
+import { listSavedGroups } from "./listSavedGroups";
+import { postSavedGroup } from "./postSavedGroup";
+import { updateSavedGroup } from "./updateSavedGroup";
+import { archiveSavedGroup, unarchiveSavedGroup } from "./archiveSavedGroup";
+import { deleteSavedGroup } from "./deleteSavedGroup";
+import { getSavedGroupReferences } from "./getSavedGroupReferences";
+import { listSavedGroupUploads } from "./listSavedGroupUploads";
+import { postSavedGroupUploadUrl } from "./postSavedGroupUploadUrl";
+import { postSavedGroupUpload } from "./postSavedGroupUpload";
+import { postSavedGroupUploadLoad } from "./postSavedGroupUploadLoad";
+import { getSavedGroupUpload } from "./getSavedGroupUpload";
+import { deleteSavedGroupUpload } from "./deleteSavedGroupUpload";
+
+// Revision routes
+import { listSavedGroupRevisions } from "./listSavedGroupRevisions";
+import { getSavedGroupRevisions } from "./getSavedGroupRevisions";
+import { getSavedGroupRevisionLatest } from "./getSavedGroupRevisionLatest";
+import { getSavedGroupRevision } from "./getSavedGroupRevision";
+import { getSavedGroupRevisionMergeStatus } from "./getSavedGroupRevisionMergeStatus";
+import { postSavedGroupRevision } from "./postSavedGroupRevision";
+import { postSavedGroupRevisionDiscard } from "./postSavedGroupRevisionDiscard";
+import { postSavedGroupRevisionPublish } from "./postSavedGroupRevisionPublish";
+import { postSavedGroupRevisionRebase } from "./postSavedGroupRevisionRebase";
+import { postSavedGroupRevisionRevert } from "./postSavedGroupRevisionRevert";
+import { postSavedGroupRevisionRequestReview } from "./postSavedGroupRevisionRequestReview";
+import { postSavedGroupRevisionSubmitReview } from "./postSavedGroupRevisionSubmitReview";
+import { postSavedGroupRevisionRecallReview } from "./postSavedGroupRevisionRecallReview";
+import { postSavedGroupRevisionReopen } from "./postSavedGroupRevisionReopen";
+import { postSavedGroupRevisionSchedulePublish } from "./postSavedGroupRevisionSchedulePublish";
+import { postSavedGroupRevisionUndoReview } from "./postSavedGroupRevisionUndoReview";
+import { putSavedGroupRevisionMetadata } from "./putSavedGroupRevisionMetadata";
+import { putSavedGroupRevisionCondition } from "./putSavedGroupRevisionCondition";
+import { putSavedGroupRevisionValues } from "./putSavedGroupRevisionValues";
+import { putSavedGroupRevisionUploadVersion } from "./putSavedGroupRevisionUploadVersion";
+import { putSavedGroupRevisionArchive } from "./putSavedGroupRevisionArchive";
+import { postSavedGroupRevisionItemsAdd } from "./postSavedGroupRevisionItemsAdd";
+import { postSavedGroupRevisionItemsRemove } from "./postSavedGroupRevisionItemsRemove";
+
+export const savedGroupsRoutes: OpenApiRoute[] = [
+  // Saved-group CRUD
+  listSavedGroups,
+  postSavedGroup,
+  listSavedGroupRevisions,
+  getSavedGroup,
+  updateSavedGroup,
+  archiveSavedGroup,
+  unarchiveSavedGroup,
+  getSavedGroupReferences,
+  deleteSavedGroup,
+
+  // Remote saved group uploads
+  listSavedGroupUploads,
+  postSavedGroupUploadUrl,
+  postSavedGroupUpload,
+  postSavedGroupUploadLoad,
+  getSavedGroupUpload,
+  deleteSavedGroupUpload,
+
+  // Revisions — reading & listing.
+  // `latest` MUST precede the `:version` route below; otherwise its int param
+  // would swallow the literal "latest" and fail validation.
+  getSavedGroupRevisions,
+  getSavedGroupRevisionLatest,
+  getSavedGroupRevision,
+
+  // Draft creation
+  postSavedGroupRevision,
+
+  // Field-level edits — accept `version: "new"` to auto-create a draft.
+  putSavedGroupRevisionMetadata,
+  putSavedGroupRevisionCondition,
+  putSavedGroupRevisionValues,
+  putSavedGroupRevisionUploadVersion,
+  putSavedGroupRevisionArchive,
+  postSavedGroupRevisionItemsAdd,
+  postSavedGroupRevisionItemsRemove,
+
+  // Review & lifecycle
+  postSavedGroupRevisionRequestReview,
+  postSavedGroupRevisionSubmitReview,
+  postSavedGroupRevisionRecallReview,
+  postSavedGroupRevisionReopen,
+  postSavedGroupRevisionSchedulePublish,
+  postSavedGroupRevisionUndoReview,
+  getSavedGroupRevisionMergeStatus,
+  postSavedGroupRevisionRebase,
+  postSavedGroupRevisionPublish,
+  postSavedGroupRevisionDiscard,
+  postSavedGroupRevisionRevert,
+];

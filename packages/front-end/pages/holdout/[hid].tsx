@@ -1,0 +1,206 @@
+import { useRouter } from "next/router";
+import { ExperimentInterfaceStringDates } from "shared/types/experiment";
+import React, { ReactElement, useState } from "react";
+import { getHoldoutStage } from "shared/util";
+import {
+  HoldoutInterfaceStringDates,
+  HoldoutMissingLinkage,
+} from "shared/validators";
+import { FeatureInterface } from "shared/types/feature";
+import useApi from "@/hooks/useApi";
+import LoadingOverlay from "@/components/LoadingOverlay";
+import useSwitchOrg from "@/services/useSwitchOrg";
+import EditMetricsForm from "@/components/Experiment/EditMetricsForm";
+import { useAuth } from "@/services/auth";
+import SnapshotProvider from "@/components/Experiment/SnapshotProvider";
+import NewPhaseForm from "@/components/Experiment/NewPhaseForm";
+import TabbedPage from "@/components/Experiment/TabbedPage";
+import PageHead from "@/components/Layout/PageHead";
+import usePermissionsUtil from "@/hooks/usePermissionsUtils";
+import EditHoldoutTargetingModal from "@/components/Holdout/EditHoldoutTargetingModal";
+import NewHoldoutForm from "@/components/Holdout/NewHoldoutForm";
+import StopHoldoutModal from "@/components/Holdout/StopHoldoutModal";
+import EditScheduleModal from "@/components/Holdout/EditScheduleModal";
+import StartHoldoutAnalysisModal from "@/components/Experiment/TabbedPage/StartHoldoutAnalysisModal";
+
+const HoldoutPage = (): ReactElement => {
+  const permissionsUtil = usePermissionsUtil();
+  const router = useRouter();
+  const { hid } = router.query;
+
+  const [stopModalOpen, setStopModalOpen] = useState(false);
+  const [metricsModalOpen, setMetricsModalOpen] = useState(false);
+  const [duplicateModalOpen, setDuplicateModalOpen] = useState(false);
+  const [phaseModalOpen, setPhaseModalOpen] = useState(false);
+  const [targetingModalOpen, setTargetingModalOpen] = useState(false);
+  const [startAnalysisModalOpen, setStartAnalysisModalOpen] = useState(false);
+  const [editHoldoutScheduleModalOpen, setEditHoldoutScheduleModalOpen] =
+    useState(false);
+
+  const { data, error, mutate } = useApi<{
+    holdout: HoldoutInterfaceStringDates;
+    experiment: ExperimentInterfaceStringDates;
+    linkedFeatures: FeatureInterface[];
+    linkedExperiments: ExperimentInterfaceStringDates[];
+    missingLinkage?: HoldoutMissingLinkage;
+    envs: string[];
+  }>(`/holdout/${hid}`);
+
+  useSwitchOrg(data?.experiment?.organization ?? null);
+
+  const { apiCall } = useAuth();
+
+  if (error) {
+    return <div>There was a problem loading the holdout</div>;
+  }
+  if (!data) {
+    return <LoadingOverlay />;
+  }
+  const {
+    experiment,
+    holdout,
+    linkedFeatures = [],
+    envs = [],
+    linkedExperiments = [],
+    missingLinkage,
+  } = data;
+  const holdoutStage = getHoldoutStage(holdout, experiment);
+
+  const startAnalysis = async () => {
+    await apiCall(`/holdout/${hid}/edit-status`, {
+      method: "POST",
+      body: JSON.stringify({
+        status: "running",
+        holdoutRunningStatus: "analysis-period",
+      }),
+    });
+    mutate();
+  };
+
+  const canEditExperiment =
+    permissionsUtil.canUpdateHoldout(holdout, { projects: holdout.projects }) &&
+    !experiment.archived;
+
+  let canRunExperiment = !experiment.archived;
+  if (envs.length > 0) {
+    if (!permissionsUtil.canRunHoldout(holdout, envs)) {
+      canRunExperiment = false;
+    }
+  }
+
+  const editMetrics = canEditExperiment
+    ? () => setMetricsModalOpen(true)
+    : null;
+  const editResult = canRunExperiment
+    ? () => {
+        if (holdoutStage === "analysis-period") {
+          setStopModalOpen(true);
+        } else {
+          setStartAnalysisModalOpen(true);
+        }
+      }
+    : null;
+  const duplicate = canEditExperiment
+    ? () => setDuplicateModalOpen(true)
+    : null;
+  const newPhase = canRunExperiment ? () => setPhaseModalOpen(true) : null;
+  const editTargeting = canRunExperiment
+    ? () => setTargetingModalOpen(true)
+    : null;
+  const editHoldoutSchedule = canRunExperiment
+    ? () => setEditHoldoutScheduleModalOpen(true)
+    : null;
+
+  return (
+    <>
+      {startAnalysisModalOpen && (
+        <StartHoldoutAnalysisModal
+          close={() => setStartAnalysisModalOpen(false)}
+          startAnalysis={startAnalysis}
+        />
+      )}
+      {metricsModalOpen && (
+        <EditMetricsForm
+          experiment={experiment}
+          cancel={() => setMetricsModalOpen(false)}
+          mutate={mutate}
+          source="hid"
+        />
+      )}
+      {stopModalOpen && (
+        <StopHoldoutModal
+          close={() => setStopModalOpen(false)}
+          mutate={mutate}
+          holdout={holdout}
+          experiment={experiment}
+        />
+      )}
+      {duplicateModalOpen && (
+        <NewHoldoutForm
+          onClose={() => setDuplicateModalOpen(false)}
+          initialHoldout={{ ...holdout, name: holdout.name + " (Copy)" }}
+          initialExperiment={experiment}
+          source="duplicate-hid"
+          duplicate
+        />
+      )}
+      {phaseModalOpen && (
+        <NewPhaseForm
+          close={() => setPhaseModalOpen(false)}
+          mutate={mutate}
+          experiment={experiment}
+          source="hid"
+        />
+      )}
+      {targetingModalOpen && (
+        <EditHoldoutTargetingModal
+          close={() => setTargetingModalOpen(false)}
+          mutate={mutate}
+          experiment={experiment}
+        />
+      )}
+      {editHoldoutScheduleModalOpen && (
+        <EditScheduleModal
+          close={() => setEditHoldoutScheduleModalOpen(false)}
+          holdout={holdout}
+          experiment={experiment}
+          mutate={mutate}
+        />
+      )}
+
+      <PageHead
+        breadcrumb={[
+          {
+            display: "Holdouts",
+            href: `/holdouts`,
+          },
+          { display: holdout.name },
+        ]}
+      />
+
+      <SnapshotProvider experiment={experiment}>
+        <TabbedPage
+          experiment={experiment}
+          holdout={holdout}
+          linkedFeatures={[]}
+          holdoutFeatures={linkedFeatures}
+          holdoutExperiments={linkedExperiments}
+          holdoutMissingLinkage={missingLinkage}
+          mutate={mutate}
+          visualChangesets={[]}
+          urlRedirects={[]}
+          editMetrics={editMetrics}
+          editResult={editResult}
+          duplicate={duplicate}
+          newPhase={newPhase}
+          envs={envs}
+          editTargeting={editTargeting}
+          editTraffic={editTargeting}
+          editSchedule={editHoldoutSchedule}
+        />
+      </SnapshotProvider>
+    </>
+  );
+};
+
+export default HoldoutPage;

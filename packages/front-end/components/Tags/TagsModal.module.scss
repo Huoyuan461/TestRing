@@ -1,0 +1,11 @@
+// Moves the Select's checkmark from the left to the right.
+.colorItem {
+  padding-left: var(--space-3);
+  padding-right: calc(var(--space-3) + 20px);
+
+  :global(.rt-SelectItemIndicator) {
+    left: auto;
+    right: var(--space-2);
+    color: var(--violet-11);
+  }
+}

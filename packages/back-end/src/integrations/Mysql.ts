@@ -1,0 +1,73 @@
+import mysql, { RowDataPacket } from "mysql2/promise";
+import { ConnectionOptions } from "mysql2";
+import { QueryResponse } from "shared/types/integrations";
+import { MysqlConnectionParams } from "shared/types/integrations/mysql";
+import { decryptDataSourceParams } from "back-end/src/services/datasource";
+import { getFactTableTypeFromMysqlTypeCode } from "back-end/src/util/warehouseColumnTypes";
+import { logger } from "back-end/src/util/logger";
+import SqlIntegration from "./SqlIntegration";
+
+export default class Mysql extends SqlIntegration {
+  params!: MysqlConnectionParams;
+  requiresDatabase = false;
+  requiresSchema = false;
+  setParams(encryptedParams: string) {
+    this.params =
+      decryptDataSourceParams<MysqlConnectionParams>(encryptedParams);
+  }
+  async runQuery(sql: string): Promise<QueryResponse> {
+    const config: ConnectionOptions = {
+      host: this.params.host,
+      port: this.params.port,
+      user: this.params.user,
+      password: this.params.password,
+      database: this.params.database,
+    };
+    if (this.params.ssl) {
+      config["ssl"] = {
+        ca: this.params.caCert,
+        cert: this.params.clientCert,
+        key: this.params.clientKey,
+      };
+    }
+    const conn = await mysql.createConnection(config);
+    try {
+      const [rows, fields] = await conn.query(sql);
+      return {
+        rows: rows as RowDataPacket[],
+        columns: fields?.map((field) => {
+          const dataType =
+            field.columnType === undefined
+              ? undefined
+              : getFactTableTypeFromMysqlTypeCode(
+                  field.columnType,
+                  field.characterSet,
+                );
+          return { name: field.name, ...(dataType && { dataType }) };
+        }),
+      };
+    } finally {
+      try {
+        await conn.end();
+      } catch (e) {
+        logger.warn(e, "Failed to close MySQL connection");
+      }
+    }
+  }
+  hasQuantileTesting(): boolean {
+    return false;
+  }
+  hasEfficientPercentile(): boolean {
+    return false;
+  }
+  canGroupPercentileCappedMetrics(): boolean {
+    return false;
+  }
+  getInformationSchemaWhereClause(): string {
+    if (!this.params.database)
+      throw new Error(
+        `No database name provided in MySql connection. Please add a database by editing the connection settings.`,
+      );
+    return `table_schema IN ('${this.params.database}')`;
+  }
+}

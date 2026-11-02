@@ -1,0 +1,3026 @@
+import { Response } from "express";
+import { cloneDeep } from "lodash";
+import { z } from "zod";
+import { freeEmailDomains } from "free-email-domains-typescript";
+import {
+  assertTargetingRulesDisjoint,
+  getNamespaceRanges,
+  getRulesForEnvironment,
+  normalizeApprovalRuleSettings,
+  parseIntWithDefaultCapped,
+  pruneApprovalRuleReferences,
+} from "shared/util";
+import {
+  canApplyExpirationPolicy,
+  canManageApiKeySecret,
+  getRoles,
+  hasSuperAdminPermission,
+  holdsAllSuperAdminPermissions,
+  normalizeSuperAdmin,
+} from "shared/permissions";
+import { isExpired } from "shared/api-key-expiration";
+import uniqid from "uniqid";
+import { LicenseInterface, accountFeatures } from "shared/enterprise";
+import {
+  AgreementType,
+  ConfirmRule,
+  updateSdkWebhookValidator,
+} from "shared/validators";
+import { entityTypes } from "shared/constants";
+import { AI_PROVIDERS } from "shared/ai";
+import { UpdateSdkWebhookProps } from "shared/types/webhook";
+import { ApiKeyInterface } from "shared/types/apikey";
+import {
+  GetOrganizationResponse,
+  CreateOrganizationPostBody,
+  Invite,
+  MemberRoleWithProjects,
+  NamespaceFormat,
+  NamespaceUsage,
+  OrganizationInterface,
+  OrganizationSettings,
+  ProjectMemberRole,
+  Role,
+  SDKAttribute,
+} from "shared/types/organization";
+import { ExperimentRule, NamespaceValue } from "shared/types/feature";
+import { TeamInterface } from "shared/types/team";
+import { getApproverRoles } from "back-end/src/revisions/approverRoles";
+import { ApiKeyModel } from "back-end/src/models/ApiKeyModel";
+import {
+  assertNamespaceHashAttributeChangeAllowed,
+  assertNamespaceNotInUse,
+} from "back-end/src/services/namespaces";
+import {
+  AuthRequest,
+  ResponseWithStatusAndError,
+} from "back-end/src/types/AuthRequest";
+import {
+  acceptInvite,
+  addMemberToOrg,
+  addMemberToOrgWithDefaultRole,
+  addPendingMemberToOrgWithDefaultRole,
+  assertCanUpdateDefaultRole,
+  assertMemberRoleInfoValid,
+  sanitizeDefaultRoleUpdate,
+  assertRoleAssignmentAllowed,
+  assertRoleChangeAllowed,
+  expandOrgMembers,
+  findVerifiedOrgsForNewUser,
+  getAISettingsForOrg,
+  getContextFromReq,
+  getInviteUrl,
+  getMembersOfTeam,
+  getNumberOfUniqueMembersAndInvites,
+  importConfig,
+  inviteUser,
+  isEnterpriseSSO,
+  isOrgScopedLogin,
+  isValidLoginMethod,
+  removeMember,
+  revokeInvite,
+  setLicenseKey,
+  assertProjectRulesReferenceProjects,
+} from "back-end/src/services/organizations";
+import { BadRequestError } from "back-end/src/util/errors";
+import { updatePassword } from "back-end/src/services/users";
+import {
+  auditDetailsCreate,
+  auditDetailsDelete,
+  auditDetailsUpdate,
+  getRecentWatchedAudits,
+  isValidAuditEntityType,
+} from "back-end/src/services/audit";
+import {
+  getAllFeatures,
+  hasNonDemoFeature,
+} from "back-end/src/models/FeatureModel";
+import {
+  ALLOW_SELF_ORG_CREATION,
+  APP_ORIGIN,
+  IS_CLOUD,
+  IS_MULTI_ORG,
+  PROHIBITED_ORGANIZATION_NAME_REGEX,
+} from "back-end/src/util/secrets";
+import {
+  sendInviteEmail,
+  sendNewMemberEmail,
+  sendPendingMemberEmail,
+  sendNewOrgEmail,
+  sendPendingMemberApprovalEmail,
+  sendOwnerEmailChangeEmail,
+} from "back-end/src/services/email";
+import {
+  createOrganization,
+  findOrganizationByInviteKey,
+  findAllOrganizations,
+  findOrganizationsByMemberId,
+  hasOrganization,
+  updateOrganization,
+  addCustomRole,
+  editCustomRole,
+  removeCustomRole,
+  deactivateRoleById,
+  activateRoleById,
+  addGetStartedChecklistItem,
+} from "back-end/src/models/OrganizationModel";
+import { ConfigFile, getConfigFileHash } from "back-end/src/init/config";
+import { getDefinitionsData } from "back-end/src/services/definitions";
+import { getDefinitionsVersionState } from "back-end/src/models/DefinitionsVersionModel";
+import {
+  buildDefinitionsEtag,
+  definitionsBuildFingerprint,
+  ifNoneMatchMatches,
+} from "back-end/src/util/definitionsEtag";
+import {
+  classifyEmail,
+  parseAttributionCookie,
+  postSignupAttributionToLicenseServer,
+} from "back-end/src/util/signup-attribution";
+import { usingOpenId } from "back-end/src/services/auth";
+import { getSdkPayloadSizeAlerts } from "back-end/src/services/sdkPayloadSize";
+import { getSSOConnectionSummary } from "back-end/src/models/SSOConnectionModel";
+import { getUserPermissions } from "back-end/src/util/organization.util";
+import {
+  buildNamespace,
+  experimentAllocatesTrafficInNamespace,
+} from "back-end/src/util/namespaces";
+import {
+  deleteUser,
+  getUserById,
+  getAllUsers,
+  getUserByEmail,
+} from "back-end/src/models/UserModel";
+import {
+  getAllExperiments,
+  getExperimentsForActivityFeed,
+  hasNonDemoExperiment,
+} from "back-end/src/models/ExperimentModel";
+import {
+  getAuditHistory,
+  getAuditedApiKeyKinds,
+} from "back-end/src/models/AuditModel";
+import { ReqContext } from "back-end/types/request";
+import { fireSdkWebhook } from "back-end/src/jobs/sdkWebhooks";
+import {
+  getInstallationName,
+  getLicenseMetaData,
+  getUserCodesForOrg,
+} from "back-end/src/services/licenseData";
+import { findSDKConnectionsByIds } from "back-end/src/models/SdkConnectionModel";
+import {
+  getLicense,
+  licenseInit,
+  getLowestPlanPerFeature,
+  getAccountPlan,
+  getEffectiveAccountPlan,
+  getLicenseError,
+  getSubscriptionFromLicense,
+  orgHasPremiumFeature,
+} from "back-end/src/enterprise";
+import { getUsageFromCache } from "back-end/src/enterprise/billing";
+import { logger } from "back-end/src/util/logger";
+import { validatePriorSettings } from "back-end/src/util/priors";
+import { getAnalysisEndDateSettingsError } from "back-end/src/services/scheduledAnalysisEndDate";
+import {
+  getInstallation,
+  setInstallationName,
+} from "back-end/src/models/InstallationModel";
+
+export async function getDefinitions(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+  const orgId = context.org.id;
+  if (!orgId) {
+    throw new Error("Must be part of an organization");
+  }
+
+  // Short-circuit with a cheap 304 before the expensive reads below when the
+  // client's cached copy is still current. The ETag combines the org's global
+  // definitions version and the versions of the projects this user can read
+  // (both bumped by relevant writes via touchDefinitionsVersion) with the
+  // user's permission fingerprint (the response is permission-filtered) and,
+  // under config.yml, the parsed file's hash (file-managed resources bypass the
+  // Mongo writes that bump the version). Gated behind a feature flag.
+  if (req.gb?.getFeatureValue("definitions-etag-304", true) === true) {
+    const { version, projectVersions } =
+      await getDefinitionsVersionState(orgId);
+    const etag = buildDefinitionsEtag({
+      version,
+      projectVersions,
+      organization: orgId,
+      permissionsFingerprint: context.getPermissionsFingerprint(),
+      buildFingerprint: definitionsBuildFingerprint(),
+      // null = the user can read all projects, so every project's version counts.
+      readableProjects: context.permissions.getProjectsWithPermission(
+        "readData",
+        await context.models.projects.getAllIdsForOrg(),
+      ),
+      configFileHash: getConfigFileHash(),
+    });
+    // Make the browser behavior we rely on explicit: store, but always
+    // revalidate (private keeps shared caches out). Vary on the org header so
+    // the cache doesn't reuse one org's entry for another.
+    res.set("Cache-Control", "private, no-cache");
+    res.vary("X-Organization");
+    res.set("ETag", etag);
+    if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
+      return res.status(304).end();
+    }
+  }
+
+  const definitions = await getDefinitionsData(context);
+
+  return res.status(200).json({
+    status: 200,
+    ...definitions,
+  });
+}
+
+export async function getActivityFeed(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+  const { userId } = context;
+  try {
+    const docs = await getRecentWatchedAudits(context, userId);
+
+    if (!docs.length) {
+      return res.status(200).json({
+        status: 200,
+        events: [],
+        experiments: [],
+        features: [],
+      });
+    }
+
+    const experimentIds = Array.from(new Set(docs.map((d) => d.entity.id)));
+    const experiments = await getExperimentsForActivityFeed(
+      context,
+      experimentIds,
+    );
+
+    res.status(200).json({
+      status: 200,
+      events: docs,
+      experiments,
+    });
+  } catch (e) {
+    res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+}
+
+// Only a plain string, so a crafted query object can't reach Mongo.
+function parseEventParam(event: unknown) {
+  return typeof event === "string" && event ? event : undefined;
+}
+
+// Serves both /history/:type and /history/:type/:id.
+export async function getHistory(
+  req: AuthRequest<
+    null,
+    { type: string; id?: string },
+    { cursor?: string; limit?: string; event?: string }
+  >,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { type, id } = req.params;
+
+  if (!isValidAuditEntityType(type)) {
+    return res.status(400).json({
+      status: 400,
+      message: `${type} is not a valid entity type. Possible entity types are: ${entityTypes}`,
+    });
+  }
+
+  // API key history can expose roles/scope/descriptions, so it needs the same
+  // permission as listing the key. Other entity types keep their org-scoped access.
+  if (type === "apiKey" && !(await canReadApiKeyHistory(context, id))) {
+    context.permissions.throwPermissionError();
+  }
+  if (
+    type === "project" &&
+    id &&
+    !context.permissions.canReadSingleProjectResource(id)
+  ) {
+    context.permissions.throwPermissionError();
+  }
+
+  // Leave out Projects the user can't read; deleted ones stay visible.
+  // Members' tokens share the apiKey log, so leave them out unless the user manages them.
+  const excludeIds =
+    type === "project"
+      ? (await context.getAllProjectIds()).filter(
+          (p) => !context.permissions.canReadSingleProjectResource(p),
+        )
+      : type === "apiKey" &&
+          !id &&
+          !context.permissions.canManagePersonalAccessTokens()
+        ? await getApiKeyIdsHiddenFromKeyViewers(context)
+        : [];
+
+  const history = await getAuditHistory(
+    context.org.id,
+    type,
+    id,
+    parseIntWithDefaultCapped(req.query.limit, 50, 100), // Max 100 per page
+    {
+      event: parseEventParam(req.query.event),
+      before: req.query.cursor ? new Date(req.query.cursor) : undefined,
+      excludeIds,
+    },
+  );
+
+  res.status(200).json({ status: 200, ...history });
+}
+
+async function canReadApiKeyHistory(
+  context: ReqContext,
+  id: string | undefined,
+): Promise<boolean> {
+  const { permissions } = context;
+  if (!id) return permissions.canViewApiKeys();
+  const key = await context.models.apiKeys.dangerousGetById(id);
+  if (key) {
+    return key.userId
+      ? key.userId === context.userId ||
+          permissions.canManagePersonalAccessTokens()
+      : permissions.canViewApiKeys();
+  }
+  // A deleted key is known only by its audits. One they can't place needs both.
+  const kinds = await getAuditedApiKeyKinds(context.org.id);
+  if (kinds.tokens.has(id)) return permissions.canManagePersonalAccessTokens();
+  if (kinds.orgKeys.has(id)) return permissions.canViewApiKeys();
+  return (
+    permissions.canViewApiKeys() && permissions.canManagePersonalAccessTokens()
+  );
+}
+
+// Members' tokens, and deleted keys their audits can't place as org keys.
+async function getApiKeyIdsHiddenFromKeyViewers(
+  context: ReqContext,
+): Promise<string[]> {
+  const [keys, kinds] = await Promise.all([
+    context.models.apiKeys.dangerousGetAllApiKeysInOrg(),
+    getAuditedApiKeyKinds(context.org.id),
+  ]);
+  const live = new Map(keys.map((k) => [k.id, k]));
+  return kinds.all.filter((id) => {
+    // Org-wide entries, like applying the expiration policy, name no key.
+    if (!id) return false;
+    const key = live.get(id);
+    return key ? !!key.userId : !kinds.orgKeys.has(id);
+  });
+}
+
+export async function putMemberRole(
+  req: AuthRequest<MemberRoleWithProjects, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+  const { org, userId } = context;
+  const {
+    role,
+    limitAccessByEnvironment,
+    environments,
+    projectRoles,
+    additionalRoles,
+  } = req.body;
+  const { id } = req.params;
+
+  if (id === userId) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot change your own role",
+    });
+  }
+
+  try {
+    assertMemberRoleInfoValid(org, {
+      role,
+      limitAccessByEnvironment,
+      environments,
+      additionalRoles,
+      projectRoles,
+    });
+    await assertProjectRulesReferenceProjects(
+      context,
+      org.members.find((m) => m.id === id)?.projectRoles,
+      projectRoles,
+    );
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+
+  const existingMember = [...org.members, ...(org.pendingMembers || [])].find(
+    (m) => m.id === id,
+  );
+  if (!existingMember) {
+    return res.status(404).json({
+      status: 404,
+      message: "Cannot find member",
+    });
+  }
+  try {
+    // Only gate a role change so existing assignments keep working
+    assertRoleChangeAllowed(org, existingMember.role, role);
+  } catch (e) {
+    return res.status(e.status || 400).json({
+      status: e.status || 400,
+      message: e.message,
+    });
+  }
+
+  org.members.forEach((m) => {
+    if (m.id === id) {
+      m.role = role;
+      m.limitAccessByEnvironment = !!limitAccessByEnvironment;
+      m.environments = environments || [];
+      m.projectRoles = projectRoles || [];
+      m.additionalRoles = additionalRoles || [];
+    }
+  });
+  org?.pendingMembers?.forEach((m) => {
+    if (m.id === id) {
+      m.role = role;
+      m.limitAccessByEnvironment = !!limitAccessByEnvironment;
+      m.environments = environments || [];
+      m.projectRoles = projectRoles || [];
+      m.additionalRoles = additionalRoles || [];
+    }
+  });
+
+  try {
+    await updateOrganization(org.id, {
+      members: org.members,
+      pendingMembers: org.pendingMembers,
+    });
+    return res.status(200).json({
+      status: 200,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message || "Failed to change role",
+    });
+  }
+}
+
+export async function putMemberProjectRole(
+  req: AuthRequest<{ projectRole: ProjectMemberRole }, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  const { org, userId } = context;
+  const { projectRole } = req.body;
+  const { id } = req.params;
+
+  // Project-admins can update project roles for their project - so we check if they have the canUpdateProject permission
+  // rather than the canManageTeam permission
+  if (!context.permissions.canUpdateProject(projectRole.project)) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (id === userId) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot change your own role",
+    });
+  }
+
+  if (!orgHasPremiumFeature(org, "advanced-permissions")) {
+    return res.status(400).json({
+      status: 400,
+      message:
+        "Your plan does not support providing users with project-level permissions.",
+    });
+  }
+
+  try {
+    // The whole rule, additional roles included — nothing rides in unchecked.
+    assertMemberRoleInfoValid(org, projectRole);
+    await assertProjectRulesReferenceProjects(
+      context,
+      org.members.find((m) => m.id === id)?.projectRoles,
+      [projectRole],
+    );
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+  const updatedProjectRole: ProjectMemberRole = {
+    ...projectRole,
+  };
+
+  let found = false;
+  org.members.forEach((m) => {
+    if (m.id === id) {
+      if (!m.projectRoles) {
+        m.projectRoles = [];
+      }
+      // Check if project role already exists
+      const existingIndex = m.projectRoles.findIndex(
+        (pr) => pr.project === projectRole.project,
+      );
+      if (existingIndex >= 0) {
+        // Update existing project role
+        m.projectRoles[existingIndex] = updatedProjectRole;
+      } else {
+        // Add new project role
+        m.projectRoles.push(updatedProjectRole);
+      }
+      found = true;
+    }
+  });
+
+  if (!found) {
+    return res.status(404).json({
+      status: 404,
+      message: "Cannot find member",
+    });
+  }
+
+  try {
+    await updateOrganization(org.id, {
+      members: org.members,
+    });
+    return res.status(200).json({
+      status: 200,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message || "Failed to update project role",
+    });
+  }
+}
+
+export async function putMember(
+  req: AuthRequest<{
+    orgId: string;
+  }>,
+  res: Response,
+) {
+  if (!req.userId || !req.email) {
+    throw new Error("Must be logged in");
+  }
+  const { orgId } = req.body;
+  if (!orgId) {
+    throw new Error("Must provide orgId");
+  }
+  if (!req.verified) {
+    throw new Error("User is not verified");
+  }
+
+  // ensure org matches one of the calculated verified org
+  const organizations = await findVerifiedOrgsForNewUser(req.email, req);
+  if (!organizations) {
+    throw new Error("Invalid orgId");
+  }
+
+  const organization = organizations.find((o) => o.id === orgId);
+  if (!organization) {
+    throw new Error("Invalid orgId");
+  }
+
+  // check if user is already a member
+  const existingMember = organization.members.find((m) => m.id === req.userId);
+  if (existingMember) {
+    return res.status(200).json({
+      status: 200,
+      message: "User is already a member of organization",
+    });
+  }
+
+  try {
+    const reqEmailLower = req.email.toLowerCase();
+    const invite: Invite | undefined = organization.invites.find(
+      (inv) => inv.email.toLowerCase() === reqEmailLower,
+    );
+    if (invite) {
+      // if user already invited, accept invite
+      await acceptInvite(invite.key, req.userId, req.email);
+    } else if (organization.autoApproveMembers) {
+      // if auto approve, add user as member
+      await addMemberToOrgWithDefaultRole({
+        organization,
+        userId: req.userId,
+      });
+    } else {
+      // otherwise, add user as pending member
+      await addPendingMemberToOrgWithDefaultRole({
+        organization,
+        name: req.name || "",
+        userId: req.userId,
+        email: req.email,
+      });
+
+      try {
+        const teamUrl = APP_ORIGIN + "/settings/team/?org=" + orgId;
+        await sendPendingMemberEmail(
+          req.name || "",
+          req.email || "",
+          organization.name,
+          organization.ownerEmail,
+          teamUrl,
+        );
+      } catch (e) {
+        req.log.error(e, "Failed to send pending member email");
+      }
+
+      return res.status(200).json({
+        status: 200,
+        isPending: true,
+        message: "Successfully added pending member to organization",
+      });
+    }
+
+    try {
+      await sendNewMemberEmail(
+        req.name || "",
+        req.email || "",
+        organization.name,
+        organization.ownerEmail,
+      );
+    } catch (e) {
+      req.log.error(e, "Failed to send new member email");
+    }
+
+    return res.status(200).json({
+      status: 200,
+      message: "Successfully added member to organization",
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message || "Failed to add member to organization",
+    });
+  }
+}
+
+export async function postMemberApproval(
+  req: AuthRequest<unknown, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+  const { id } = req.params;
+
+  const pendingMember = org?.pendingMembers?.find((m) => m.id === id);
+  if (!pendingMember) {
+    return res.status(404).json({
+      status: 404,
+      message: "Cannot find pending member",
+    });
+  }
+
+  try {
+    await addMemberToOrg({
+      organization: org,
+      userId: pendingMember.id,
+      role: pendingMember.role,
+      limitAccessByEnvironment: pendingMember.limitAccessByEnvironment,
+      environments: pendingMember.environments,
+      projectRoles: pendingMember.projectRoles,
+      additionalRoles: pendingMember.additionalRoles,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message || "Failed to approve member",
+    });
+  }
+
+  try {
+    const url = APP_ORIGIN + "/?org=" + org.id;
+    await sendPendingMemberApprovalEmail(
+      pendingMember.name || "",
+      pendingMember.email || "",
+      org.name,
+      url,
+    );
+  } catch (e) {
+    req.log.error(e, "Failed to send pending member approval email");
+  }
+
+  return res.status(200).json({
+    status: 200,
+    message: "Successfully added member to organization",
+  });
+}
+
+export async function postAutoApproveMembers(
+  req: AuthRequest<{ state: boolean }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+  const { org } = context;
+  const { state } = req.body;
+
+  try {
+    await updateOrganization(org.id, {
+      autoApproveMembers: state,
+    });
+    return res.status(200).json({
+      status: 200,
+      message: "Successfully updated auto approve members",
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message || "Failed to update auto approve members",
+    });
+  }
+}
+
+export async function putInviteRole(
+  req: AuthRequest<MemberRoleWithProjects, { key: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+  const {
+    role,
+    limitAccessByEnvironment,
+    environments,
+    projectRoles,
+    additionalRoles,
+  } = req.body;
+  const { key } = req.params;
+  const originalInvites: Invite[] = cloneDeep(org.invites);
+
+  try {
+    assertMemberRoleInfoValid(org, {
+      role,
+      limitAccessByEnvironment,
+      environments,
+      additionalRoles,
+      projectRoles,
+    });
+    await assertProjectRulesReferenceProjects(
+      context,
+      org.invites.find((invite) => invite.key === key)?.projectRoles,
+      projectRoles,
+    );
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+
+  const existingInvite = originalInvites.find((m) => m.key === key);
+  if (!existingInvite) {
+    return res.status(404).json({
+      status: 404,
+      message: "Cannot find member",
+    });
+  }
+  try {
+    // Only gate a role change so existing invites keep working
+    assertRoleChangeAllowed(org, existingInvite.role, role);
+  } catch (e) {
+    return res.status(e.status || 400).json({
+      status: e.status || 400,
+      message: e.message,
+    });
+  }
+
+  org.invites.forEach((m) => {
+    if (m.key === key) {
+      m.role = role;
+      m.limitAccessByEnvironment = !!limitAccessByEnvironment;
+      m.environments = environments || [];
+      m.projectRoles = projectRoles || [];
+      m.additionalRoles = additionalRoles || [];
+    }
+  });
+
+  try {
+    await updateOrganization(org.id, {
+      invites: org.invites,
+    });
+    await req.audit({
+      event: "organization.update",
+      entity: {
+        object: "organization",
+        id: org.id,
+      },
+      details: auditDetailsUpdate(
+        { invites: originalInvites },
+        { invites: org.invites },
+      ),
+    });
+    return res.status(200).json({
+      status: 200,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message || "Failed to change role",
+    });
+  }
+}
+
+export async function getOrganization(
+  req: AuthRequest<unknown, unknown, { forceLicenseRefresh?: string }>,
+  res: Response<GetOrganizationResponse | { status: 200; organization: null }>,
+) {
+  if (!req.organization) {
+    return res.status(200).json({
+      status: 200,
+      organization: null,
+    });
+  }
+
+  const context = getContextFromReq(req);
+  const { org, userId } = context;
+  const forceLicenseRefresh = req.query.forceLicenseRefresh !== undefined;
+
+  const {
+    invites,
+    members,
+    ownerEmail,
+    demographicData,
+    name,
+    id,
+    url,
+    freeSeats,
+    settings,
+    disableSelfServeBilling,
+    licenseKey,
+    messages,
+    externalId,
+    setupEventTracker,
+    isVercelIntegration,
+  } = org;
+
+  const resolveLicense =
+    async (): Promise<Partial<LicenseInterface> | null> => {
+      if (!licenseKey && !process.env.LICENSE_KEY) return null;
+      // automatically set the license data based on org license key
+      let license: Partial<LicenseInterface> | null =
+        getLicense(licenseKey || process.env.LICENSE_KEY) || null;
+      if (
+        forceLicenseRefresh ||
+        !license ||
+        (license.organizationId && license.organizationId !== id)
+      ) {
+        try {
+          license =
+            (await licenseInit(
+              org,
+              getUserCodesForOrg,
+              getLicenseMetaData,
+              forceLicenseRefresh,
+            )) || null;
+        } catch (e) {
+          logger.error(e, "setting license failed");
+          if (forceLicenseRefresh) {
+            throw e;
+          }
+        }
+      }
+      return license;
+    };
+
+  // These lookups don't depend on each other, so run them in parallel
+  const [
+    license,
+    installationName,
+    expandedMembers,
+    agreements,
+    watch,
+    sdkPayloadSizeAlerts,
+    expiringPersonalAccessTokens,
+    expiringApiKeys,
+  ] = await Promise.all([
+    resolveLicense(),
+    getInstallationName(org),
+    expandOrgMembers(members, userId),
+    context.models.agreements.getAll(),
+    context.models.watch.getWatchedByUser(userId),
+    getSdkPayloadSizeAlerts(context),
+    context.models.apiKeys.getExpiringPersonalAccessTokens(userId),
+    // Renewing a key means extending it (Edit) or replacing it (Create).
+    context.permissions.canCreateApiKey() ||
+    context.permissions.canUpdateApiKey()
+      ? context.models.apiKeys.getExpiringOrgApiKeys()
+      : [],
+  ]);
+
+  const filteredAttributes = settings?.attributeSchema?.filter((attribute) =>
+    context.permissions.canReadMultiProjectResource(attribute.projects),
+  );
+
+  const filteredEnvironments = settings?.environments?.filter((environment) =>
+    context.permissions.canReadMultiProjectResource(environment.projects),
+  );
+
+  // Use a stripped down list of invites if the user doesn't have permission to manage the team
+  // The full invite object contains a key which can be used to accept the invite
+  // Without this filtering, a user could accept an invite of a higher-privileged user and assume their role
+  const filteredInvites = context.permissions.canManageTeam()
+    ? invites
+    : invites.map((i) => ({ email: i.email }));
+
+  // Some other global org data needed by the front-end
+  const enterpriseSSO = isEnterpriseSSO(req.loginMethod)
+    ? getSSOConnectionSummary(req.loginMethod)
+    : null;
+
+  // Returned here so every page can gate AI affordances off the org's real key
+  // state without a second request. The keys never leave the back end.
+  const { keySource, sttModel } = await getAISettingsForOrg(context);
+  const aiKeyProviders = AI_PROVIDERS.filter((p) => keySource[p] !== "none");
+
+  // Teams were already loaded (unfiltered) by the auth middleware
+  const teams = context.teams;
+
+  const teamsWithMembers: TeamInterface[] = teams.map((team) => {
+    const memberIds = getMembersOfTeam(org, team.id);
+    return {
+      ...team,
+      members: memberIds,
+    };
+  });
+
+  const currentUserPermissions = getUserPermissions(
+    req.currentUser,
+    org,
+    teams || [],
+    req.restrictedProjects,
+  );
+  const agreementsAgreed = Array.from(
+    new Set(agreements.map((a) => a.agreement as AgreementType)),
+  );
+  const seatsInUse = getNumberOfUniqueMembersAndInvites(org);
+
+  const commercialFeatureLowestPlan = getLowestPlanPerFeature(accountFeatures);
+  const effectiveAccountPlan = getEffectiveAccountPlan(org);
+
+  // Keeps the "license" prefix the UI branches on without exposing the key.
+  const canSeeLicenseKey = context.permissions.canManageBilling();
+  const maskKey = (key?: string) =>
+    key && !canSeeLicenseKey ? `${key.slice(0, 8)}…` : key;
+
+  return res.status(200).json({
+    status: 200,
+    enterpriseSSO,
+    accountPlan: getAccountPlan(org),
+    effectiveAccountPlan,
+    licenseError: getLicenseError(org),
+    commercialFeatures: [...accountFeatures[effectiveAccountPlan]],
+    commercialFeatureLowestPlan: commercialFeatureLowestPlan,
+    roles: getRoles(org),
+    members: expandedMembers,
+    currentUserPermissions,
+    teams: teamsWithMembers,
+    license: license && { ...license, id: maskKey(license.id) },
+    installationName: installationName || null,
+    subscription: license ? getSubscriptionFromLicense(license) : null,
+    agreements: agreementsAgreed || [],
+    aiKeyProviders,
+    sttModel,
+    watching: {
+      experiments: watch?.experiments || [],
+      features: watch?.features || [],
+    },
+    organization: {
+      invites: filteredInvites as Invite[],
+      ownerEmail,
+      demographicData,
+      externalId,
+      name,
+      id,
+      url,
+      licenseKey: maskKey(licenseKey),
+      freeSeats,
+      enterprise: org.enterprise,
+      disableSelfServeBilling,
+      freeTrialDate: org.freeTrialDate,
+      discountCode: org.discountCode || "",
+      customRoles: org.customRoles,
+      deactivatedRoles: org.deactivatedRoles,
+      isVercelIntegration,
+      limits: org.limits,
+      settings: {
+        ...settings,
+        attributeSchema: filteredAttributes,
+        environments: filteredEnvironments,
+      },
+      autoApproveMembers: org.autoApproveMembers,
+      suspended: org.suspended,
+      members: org.members,
+      messages: messages || [],
+      pendingMembers: org.pendingMembers,
+      getStartedChecklistItems: org.getStartedChecklistItems,
+      setupEventTracker,
+      dateCreated: org.dateCreated,
+    },
+    seatsInUse,
+    usage: await getUsageFromCache(org),
+    sdkPayloadSizeAlerts,
+    expiringPersonalAccessTokens,
+    expiringApiKeys,
+  });
+}
+
+export async function getNamespaces(req: AuthRequest, res: Response) {
+  if (!req.organization) {
+    return res.status(200).json({
+      status: 200,
+      organization: null,
+    });
+  }
+  const context = getContextFromReq(req);
+  const { environments } = context;
+
+  const namespaces: NamespaceUsage = {};
+
+  // Get active legacy experiment rules on features
+  const allFeatures = await getAllFeatures(context);
+  allFeatures.forEach((f) => {
+    if (f.archived) return;
+    environments.forEach((env) => {
+      if (!f.environmentSettings?.[env]?.enabled) return;
+      // v2: rules live on feature.rules, filter to this env.
+      const rules = getRulesForEnvironment(f.rules ?? [], env);
+      rules
+        .filter(
+          (r) =>
+            r.enabled &&
+            r.type === "experiment" &&
+            r.namespace &&
+            r.namespace.enabled,
+        )
+        .forEach((r) => {
+          const expRule = r as ExperimentRule;
+          const ns = expRule.namespace as NamespaceValue;
+          namespaces[ns.name] = namespaces[ns.name] || [];
+
+          getNamespaceRanges(ns).forEach((range) => {
+            namespaces[ns.name].push({
+              link: `/features/${f.id}`,
+              name: f.id,
+              id: f.id,
+              trackingKey: expRule.trackingKey || f.id,
+              start: range[0],
+              end: range[1],
+              environment: env,
+            });
+          });
+        });
+    });
+  });
+
+  const allExperiments = await getAllExperiments(context);
+  allExperiments.forEach((e) => {
+    // Skip if a namespace isn't enabled on the latest phase
+    const phases = e.phases ?? [];
+    const phase = phases[phases.length - 1];
+    if (!phase?.namespace?.enabled) return;
+
+    const ns = phase.namespace as NamespaceValue;
+
+    // Skip archived experiments, ones not linked to any changes, and stopped
+    // ones without a temporary rollout — none of them reach the payload. This
+    // is the same check the delete / re-hash guards enforce, so what this page
+    // lists as usage is exactly what those refuse to break.
+    if (!experimentAllocatesTrafficInNamespace(e, ns.name)) return;
+
+    namespaces[ns.name] = namespaces[ns.name] || [];
+
+    getNamespaceRanges(ns).forEach((range) => {
+      namespaces[ns.name].push({
+        link: `/experiment/${e.id}`,
+        name: e.name,
+        id: e.trackingKey,
+        trackingKey: e.trackingKey,
+        start: range[0],
+        end: range[1],
+        environment: "",
+      });
+    });
+  });
+
+  res.status(200).json({
+    status: 200,
+    namespaces,
+  });
+  return;
+}
+
+export async function postNamespaces(
+  req: AuthRequest<{
+    label: string;
+    description: string;
+    status: "active" | "inactive";
+    hashAttribute?: string;
+    format?: NamespaceFormat;
+  }>,
+  res: Response,
+) {
+  const {
+    label,
+    description,
+    status,
+    hashAttribute,
+    format = "multiRange",
+  } = req.body;
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canCreateNamespace()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+
+  const namespaces = org.settings?.namespaces || [];
+
+  // Namespace with the same name already exists
+  if (namespaces.filter((n) => n.label === label).length > 0) {
+    throw new Error("A namespace with this name already exists.");
+  }
+
+  // Create a unique id for this new namespace - We might want to clean this
+  // up later, but for now, 'name' is the unique identifier, and 'label' is
+  // the display name.
+  const name = uniqid("ns-");
+
+  const newNamespace = buildNamespace({
+    name,
+    label,
+    description,
+    status,
+    format,
+    hashAttribute,
+  });
+
+  await updateOrganization(org.id, {
+    settings: {
+      ...org.settings,
+      namespaces: [...namespaces, newNamespace],
+    },
+  });
+
+  await req.audit({
+    event: "organization.update",
+    entity: {
+      object: "organization",
+      id: org.id,
+    },
+    details: auditDetailsUpdate(
+      { settings: { namespaces } },
+      {
+        settings: {
+          namespaces: [...namespaces, newNamespace],
+        },
+      },
+    ),
+  });
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putNamespaces(
+  req: AuthRequest<
+    {
+      label: string;
+      description: string;
+      status: "active" | "inactive";
+      hashAttribute?: string;
+      format?: NamespaceFormat;
+    },
+    { name: string }
+  >,
+  res: Response,
+) {
+  const { label, description, status, hashAttribute } = req.body;
+  const { name } = req.params;
+
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canUpdateNamespace()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+
+  const namespaces = org.settings?.namespaces || [];
+
+  // Make sure this namespace exists
+  const target = namespaces.find((n) => n.name === name);
+  if (!target) {
+    throw new Error("Namespace not found.");
+  }
+
+  await assertNamespaceHashAttributeChangeAllowed(
+    context,
+    target,
+    hashAttribute,
+  );
+
+  const updatedNamespaces = namespaces.map((n) => {
+    if (n.name !== name) return n;
+
+    const existingHashAttribute =
+      n.format === "multiRange" ? n.hashAttribute : undefined;
+    const existingSeed = n.format === "multiRange" ? n.seed : undefined;
+
+    // Treat missing fields as "leave alone" — partial PUTs (e.g. the
+    // Disable/Enable toggle on the namespaces page) should not blank out
+    // existing display fields on the namespace.
+    return buildNamespace({
+      name: n.name,
+      label: label ?? n.label ?? n.name,
+      description: description ?? n.description ?? "",
+      status: status ?? n.status ?? "active",
+      format: n.format ?? "legacy",
+      hashAttribute: hashAttribute ?? existingHashAttribute,
+      existingHashAttribute,
+      existingSeed,
+    });
+  });
+
+  await updateOrganization(org.id, {
+    settings: {
+      ...org.settings,
+      namespaces: updatedNamespaces,
+    },
+  });
+
+  await req.audit({
+    event: "organization.update",
+    entity: {
+      object: "organization",
+      id: org.id,
+    },
+    details: auditDetailsUpdate(
+      { settings: { namespaces } },
+      { settings: { namespaces: updatedNamespaces } },
+    ),
+  });
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function deleteNamespace(
+  req: AuthRequest<null, { name: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canDeleteNamespace()) {
+    context.permissions.throwPermissionError();
+  }
+  const { org } = context;
+  const { name } = req.params;
+
+  const namespaces = org.settings?.namespaces || [];
+
+  const updatedNamespaces = namespaces.filter((n) => {
+    return n.name !== name;
+  });
+
+  if (namespaces.length === updatedNamespaces.length) {
+    throw new Error("Namespace not found.");
+  }
+
+  await assertNamespaceNotInUse(context, name, "delete");
+
+  await updateOrganization(org.id, {
+    settings: {
+      ...org.settings,
+      namespaces: updatedNamespaces,
+    },
+  });
+
+  await req.audit({
+    event: "organization.update",
+    entity: {
+      object: "organization",
+      id: org.id,
+    },
+    details: auditDetailsUpdate(
+      { settings: { namespaces } },
+      { settings: { namespaces: updatedNamespaces } },
+    ),
+  });
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function getInviteInfo(
+  req: AuthRequest<unknown, { key: string }>,
+  res: ResponseWithStatusAndError<{ organization: string; role: string }>,
+) {
+  const { key } = req.params;
+
+  try {
+    if (!req.userId) {
+      throw new Error("Must be logged in");
+    }
+    const org = await findOrganizationByInviteKey(key);
+
+    if (!org) {
+      throw new Error("Invalid or expired invitation key");
+    }
+
+    const invite = org.invites.find((i) => i.key === key);
+    if (!invite) {
+      throw new Error("Invalid or expired invitation key");
+    }
+
+    return res.status(200).json({
+      status: 200,
+      organization: org.name,
+      role: invite.role,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+}
+
+export async function postInviteAccept(
+  req: AuthRequest<{ key: string }>,
+  res: Response,
+) {
+  const { key } = req.body;
+
+  try {
+    if (!req.userId || !req.email) {
+      throw new Error("Must be logged in");
+    }
+    // An SSO or Vercel login only vouches for the email within its own org
+    if (isOrgScopedLogin(req)) {
+      const invitingOrg = await findOrganizationByInviteKey(key);
+      if (invitingOrg && !isValidLoginMethod(invitingOrg, req)) {
+        throw new Error(
+          "Log out and sign in with Google or email and password to accept this invitation.",
+        );
+      }
+    }
+    const org = await acceptInvite(key, req.userId, req.email);
+    await licenseInit(org, getUserCodesForOrg, getLicenseMetaData, true);
+
+    return res.status(200).json({
+      status: 200,
+      orgId: org.id,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+}
+
+export async function postInvite(
+  req: AuthRequest<
+    {
+      email: string;
+    } & MemberRoleWithProjects
+  >,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+  const {
+    email,
+    role,
+    limitAccessByEnvironment,
+    environments,
+    projectRoles,
+    additionalRoles,
+  } = req.body;
+
+  // Make sure role is valid
+  try {
+    assertMemberRoleInfoValid(org, {
+      role,
+      limitAccessByEnvironment,
+      environments,
+      additionalRoles,
+      projectRoles,
+    });
+    await assertProjectRulesReferenceProjects(context, undefined, projectRoles);
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+
+  const { emailSent, inviteUrl } = await inviteUser({
+    organization: org,
+    email,
+    role,
+    limitAccessByEnvironment,
+    environments,
+    projectRoles,
+    additionalRoles,
+    invitedBy: req.email,
+  });
+
+  return res.status(200).json({
+    status: 200,
+    inviteUrl,
+    emailSent,
+  });
+}
+
+export async function deleteMember(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org, userId } = context;
+  const { id } = req.params;
+
+  if (id === userId) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot change your own role",
+    });
+  }
+
+  await removeMember(org, id);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function postInviteResend(
+  req: AuthRequest<{ key: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+  const { key } = req.body;
+
+  let emailSent = false;
+  try {
+    await sendInviteEmail(org, key);
+    emailSent = true;
+  } catch (e) {
+    req.log.error(e, "Error sending email");
+    emailSent = false;
+  }
+
+  const inviteUrl = getInviteUrl(key);
+  return res.status(200).json({
+    status: 200,
+    inviteUrl,
+    emailSent,
+  });
+}
+
+export async function deleteInvite(
+  req: AuthRequest<{ key: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageTeam()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { org } = context;
+  const { key } = req.body;
+
+  await revokeInvite(org, key);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function signup(
+  req: AuthRequest<CreateOrganizationPostBody>,
+  res: Response,
+) {
+  // Note: Request will not have an organization at this point. Do not use getContextFromReq
+  const { company, externalId, demographicData } = req.body;
+
+  // The new org wouldn't accept this login, so the user would be locked out of it
+  if (isOrgScopedLogin(req)) {
+    throw new Error(
+      "Log out and sign in with Google or email and password to create an organization.",
+    );
+  }
+
+  const orgs = await hasOrganization();
+  // Only allow one organization per site unless IS_MULTI_ORG is true
+  if (!IS_MULTI_ORG && orgs) {
+    throw new Error("An organization already exists");
+  }
+
+  let verifiedDomain = "";
+  if (IS_MULTI_ORG) {
+    if (
+      orgs &&
+      !ALLOW_SELF_ORG_CREATION &&
+      !hasSuperAdminPermission(req.superAdmin, "create")
+    ) {
+      throw new Error(
+        "You are not allowed to create an organization.  Ask your site admin.",
+      );
+    }
+    // if the owner is verified, try to infer a verified domain
+    if (req.email && req.verified) {
+      const domain = req.email.toLowerCase().split("@")[1] || "";
+      const isFreeDomain = freeEmailDomains.includes(domain);
+      if (!isFreeDomain) {
+        verifiedDomain = domain;
+      }
+    }
+  }
+
+  try {
+    if (company.length < 3) {
+      throw Error("Company length must be at least 3 characters");
+    }
+    if (IS_CLOUD && PROHIBITED_ORGANIZATION_NAME_REGEX?.test(company)) {
+      req.log.warn(
+        {
+          event: "signup_blocked_prohibited_organization_name",
+          company,
+          userId: req.userId,
+        },
+        "Blocked signup with prohibited organization name",
+      );
+      throw Error(
+        "Unable to create organization. Please contact support@testring.dev",
+      );
+    }
+    if (!req.userId) {
+      throw Error("Must be logged in");
+    }
+    const org = await createOrganization({
+      email: req.email,
+      userId: req.userId,
+      name: company,
+      verifiedDomain,
+      externalId,
+      demographicData,
+    });
+
+    // Forward marketing attribution to central-license-server for the new
+    // org owner (best-effort, Cloud-only). Failures are logged and swallowed
+    // so attribution issues never block org creation.
+    if (IS_CLOUD) {
+      try {
+        await postSignupAttributionToLicenseServer({
+          organizationId: org.id,
+          userId: req.userId,
+          email: req.email,
+          emailType: classifyEmail(req.email),
+          attribution: parseAttributionCookie(req),
+        });
+      } catch (e) {
+        req.log.error(
+          e,
+          "Failed to forward signup attribution to license server",
+        );
+      }
+    }
+
+    req.organization = org;
+    const context = getContextFromReq(req);
+
+    const project = await context.models.projects.create({
+      name: "My First Project",
+    });
+
+    // Alert the site manager about new organizations that are created
+    try {
+      await sendNewOrgEmail(company, req.email);
+    } catch (e) {
+      req.log.error(e, "New org email sending failure");
+    }
+
+    // Include project id in response
+    res.status(200).json({
+      status: 200,
+      orgId: org.id,
+      projectId: project.id,
+    });
+  } catch (e) {
+    res.status(400).json({
+      status: 400,
+      message: e.message || "An error occurred",
+    });
+  }
+}
+
+export async function putOrganization(
+  req: AuthRequest<Partial<OrganizationInterface>>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const {
+    name,
+    installationName,
+    ownerEmail,
+    settings,
+    connections,
+    externalId,
+    licenseKey,
+  } = req.body;
+
+  // An object here would reach the global users lookup as a Mongo operator
+  if (ownerEmail && typeof ownerEmail !== "string") {
+    return res.status(400).json({ status: 400, message: "Invalid ownerEmail" });
+  }
+
+  if (connections || name || ownerEmail || installationName) {
+    if (!context.permissions.canManageOrgSettings()) {
+      context.permissions.throwPermissionError();
+    }
+  }
+  if (licenseKey && !context.permissions.canManageBilling()) {
+    context.permissions.throwPermissionError();
+  }
+  if (settings) {
+    (Object.keys(settings) as (keyof OrganizationSettings)[]).forEach((k) => {
+      if (k === "environments") {
+        throw new Error(
+          "Not supported: Updating organization environments not supported via this route.",
+        );
+      } else if (k === "sdkInstructionsViewed" || k === "visualEditorEnabled") {
+        if (
+          !context.permissions.canCreateSDKConnection({
+            projects: [],
+            environment: "",
+          })
+        ) {
+          context.permissions.throwPermissionError();
+        }
+      } else if (k === "attributeSchema") {
+        throw new Error(
+          "Not supported: Updating organization attributes not supported via this route.",
+        );
+      } else if (k === "northStar") {
+        if (!context.permissions.canManageNorthStarMetric()) {
+          context.permissions.throwPermissionError();
+        }
+      } else if (k === "namespaces") {
+        throw new Error(
+          "Not supported: Updating namespaces not supported via this route.",
+        );
+      } else {
+        if (!context.permissions.canManageOrgSettings()) {
+          context.permissions.throwPermissionError();
+        }
+      }
+    });
+    if ("defaultRole" in settings) {
+      await sanitizeDefaultRoleUpdate(context, settings);
+    }
+  }
+
+  try {
+    const updates: Partial<OrganizationInterface> = {};
+
+    const orig: Partial<OrganizationInterface> = {};
+    if (!context.hasPremiumFeature("require-approvals")) {
+      if (settings?.approvalFlows?.savedGroups?.some((sg) => sg?.required)) {
+        throw new Error(
+          "Saved Groups approval flows require the Require Approvals enterprise feature.",
+        );
+      }
+    }
+
+    if (name) {
+      updates.name = name;
+      orig.name = org.name;
+    }
+    if (installationName && !IS_CLOUD) {
+      const installation = await getInstallation();
+      const currentName = installation.name;
+      if (installationName && currentName !== installationName) {
+        await req.audit({
+          event: "installation.update",
+          entity: {
+            object: "installation",
+            id: installation.id,
+          },
+          details: auditDetailsUpdate(
+            { name: currentName },
+            { name: installationName },
+          ),
+        });
+
+        await setInstallationName(installationName);
+      }
+    }
+    if (ownerEmail && ownerEmail !== org.ownerEmail) {
+      // the owner email is being changed
+      const newOwnerUser = await getUserByEmail(ownerEmail);
+      if (!newOwnerUser) {
+        throw Error("New owner does not have an account");
+      }
+      updates.ownerEmail = ownerEmail;
+      orig.ownerEmail = org.ownerEmail;
+      // send email to original owner and new owner alerting them of the change:
+      try {
+        await sendOwnerEmailChangeEmail(
+          req.email,
+          org.name,
+          org.ownerEmail,
+          ownerEmail,
+        );
+      } catch (e) {
+        req.log.error(e, "Failed to send owner email change email");
+      }
+    }
+    if (externalId !== undefined) {
+      updates.externalId = externalId;
+      orig.externalId = org.externalId;
+    }
+    if (settings) {
+      // Drops rule references to deleted teams, environments, and projects, so
+      // the settings UI's "Saving removes it" note is true and a stale
+      // round-tripped rule can never block the save.
+      const pruned = pruneApprovalRuleReferences(
+        normalizeApprovalRuleSettings(settings),
+        {
+          environments: (org.settings?.environments ?? []).map((e) => e.id),
+          teams: (context.teams ?? []).map((t) => t.id),
+          projects: await context.getAllProjectIds(),
+        },
+      );
+      if (pruned.targetingReviewMode) {
+        assertTargetingRulesDisjoint(pruned.targetingReviewMode);
+      }
+      updates.settings = { ...org.settings, ...pruned };
+      orig.settings = org.settings;
+    }
+
+    if (licenseKey && licenseKey.trim() !== org.licenseKey) {
+      updates.licenseKey = licenseKey.trim();
+      orig.licenseKey = org.licenseKey;
+      await setLicenseKey(org, updates.licenseKey);
+    }
+
+    validatePriorSettings(updates.settings?.metricDefaults?.priorSettings);
+
+    const analysisEndDateError = getAnalysisEndDateSettingsError(
+      settings?.updateSchedule,
+    );
+    if (analysisEndDateError) {
+      context.throwBadRequestError(analysisEndDateError);
+    }
+
+    for (const field of [
+      "maxPatLifetimeDays",
+      "maxApiKeyLifetimeDays",
+    ] as const) {
+      const value = settings?.[field];
+      // `null` clears the policy; any set value is a day count with the same
+      // 1-day floor the major providers use.
+      if (
+        (value ?? null) !== null &&
+        (!Number.isInteger(value) || (value as number) < 1)
+      ) {
+        context.throwBadRequestError(
+          "Maximum token lifetime must be a whole number of days, at least 1",
+        );
+      }
+    }
+
+    const topValuesLookbackValue = settings?.topValuesLookbackValue;
+    if (
+      typeof topValuesLookbackValue === "number" &&
+      (!Number.isInteger(topValuesLookbackValue) ||
+        topValuesLookbackValue <= 0 ||
+        topValuesLookbackValue > 365)
+    ) {
+      throw new Error(
+        "Top values lookback value must be an integer between 1 and 365",
+      );
+    }
+
+    await updateOrganization(org.id, updates);
+
+    await req.audit({
+      event: "organization.update",
+      entity: {
+        object: "organization",
+        id: org.id,
+      },
+      details: auditDetailsUpdate(orig, updates),
+    });
+
+    res.status(200).json({
+      status: 200,
+    });
+  } catch (e) {
+    res.status(400).json({
+      status: 400,
+      message: e.message || "An error occurred",
+    });
+  }
+}
+
+export const autoAddGroupsAttribute = async (
+  req: AuthRequest<never>,
+  res: Response<{ status: 200; added: boolean }>,
+) => {
+  // Add missing `$groups` attribute automatically if it's being referenced by a Saved Group
+  const context = getContextFromReq(req);
+  const { org } = context;
+
+  // TODO: When we add project-scoping to saved groups - pass in the actual projects array below
+  if (!context.permissions.canCreateAttribute({})) {
+    context.permissions.throwPermissionError();
+  }
+
+  let added = false;
+
+  const attributeSchema = org.settings?.attributeSchema;
+  if (
+    attributeSchema &&
+    !attributeSchema.some((attribute) => attribute.property === "$groups")
+  ) {
+    const newAttributeSchema: SDKAttribute[] = [
+      ...attributeSchema,
+      {
+        property: "$groups",
+        datatype: "string[]",
+      },
+    ];
+
+    const orig = {
+      settings: {
+        ...org.settings,
+      },
+    };
+
+    const updates = {
+      settings: {
+        ...org.settings,
+        attributeSchema: newAttributeSchema,
+      },
+    };
+
+    added = true;
+
+    await updateOrganization(org.id, updates);
+
+    await req.audit({
+      event: "organization.update",
+      entity: {
+        object: "organization",
+        id: org.id,
+      },
+      details: auditDetailsUpdate(orig, updates),
+    });
+  }
+
+  return res.status(200).json({
+    status: 200,
+    added,
+  });
+};
+
+export async function getApiKeys(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+  const keys = await context.models.apiKeys.getAll();
+  // Exclude OAuth-issued access tokens (they carry an oauthClientId): they're
+  // hashed and short-lived, so they don't belong in the API Keys / PAT UI.
+  const filteredKeys = keys.filter(
+    (k) => !k.oauthClientId && (!k.userId || k.userId === req.userId),
+  );
+
+  res.status(200).json({
+    status: 200,
+    keys: filteredKeys,
+  });
+}
+
+// Admin-only inventory of every member's PAT, so a compromised token can be
+// revoked without waiting on its owner. Values are stripped by the model's
+// `sanitize`, and `postApiKeyReveal` still refuses another user's token.
+export async function getPersonalAccessTokens(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManagePersonalAccessTokens()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const keys = await context.models.apiKeys.getAllPersonalAccessTokens();
+
+  res.status(200).json({
+    status: 200,
+    keys,
+  });
+}
+
+// The current role of each key that approved as itself, so the review panel
+// judges a key's approval the way publishing does. Members' roles are already
+// on the client.
+// The roles of org keys that approved, for the review panel. Like members'
+// roles, they're visible to every member.
+export async function getApproverKeyRoles(
+  req: AuthRequest<null, null, { ids?: unknown }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const ids = z
+    .string()
+    .catch("")
+    .parse(req.query.ids)
+    .split(",")
+    .filter((id) => id && !context.org.members.some((m) => m.id === id))
+    .slice(0, 100);
+  const roles = await getApproverRoles(context, ids);
+  res.status(200).json({ status: 200, roles: Object.fromEntries(roles) });
+}
+
+// Rejects a malformed date rather than letting `new Date()` yield Invalid Date,
+// which would persist as null and silently read as "never expires".
+function parseExpiresAt(input: string | null | undefined): Date | null {
+  if ((input ?? null) === null) return null;
+  const date = new Date(input as string);
+  if (Number.isNaN(date.getTime())) {
+    throw new BadRequestError("Invalid expiration date");
+  }
+  return date;
+}
+
+// Brings existing keys of one kind into line with the org's expiration policy.
+// The kind is the only client input: the server selects the affected keys from
+// its own policy value, so this can't be aimed at an arbitrary set of keys.
+export async function postApplyExpirationPolicy(
+  req: AuthRequest<{ kind: "pat" | "secret" }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { kind } = req.body;
+
+  if (kind !== "pat" && kind !== "secret") {
+    context.throwBadRequestError("Invalid key kind");
+  }
+  if (!canApplyExpirationPolicy(context.permissions, kind)) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { updated, expiresAt } =
+    await context.models.apiKeys.applyExpirationPolicy(kind);
+
+  if (updated > 0) {
+    await req.audit({
+      event: "apiKey.update",
+      entity: { object: "apiKey", id: "" },
+      details: JSON.stringify({
+        appliedExpirationPolicy: kind,
+        updated,
+        expiresAt,
+      }),
+    });
+  }
+
+  res.status(200).json({ status: 200, updated, expiresAt });
+}
+
+export async function postApiKey(
+  req: AuthRequest<{
+    description?: string;
+    type: string;
+    scopedRole?: string;
+    limitAccessByEnvironment?: boolean;
+    environments?: string[];
+    additionalRoles?: ApiKeyInterface["additionalRoles"];
+    projectRoles?: ApiKeyInterface["projectRoles"];
+    actAs?: ApiKeyInterface["actAs"];
+    expiresAt?: string | null;
+    confirmRules?: ConfirmRule[] | null;
+  }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { userId } = context;
+  const {
+    description = "",
+    type,
+    scopedRole,
+    limitAccessByEnvironment,
+    environments,
+    additionalRoles,
+    projectRoles,
+    actAs,
+    expiresAt: expiresAtInput,
+    confirmRules,
+  } = req.body;
+
+  const expiresAt = parseExpiresAt(expiresAtInput);
+
+  let key: ApiKeyInterface;
+  // Handle user personal access tokens
+  if (type === "user") {
+    if (!userId) {
+      throw new Error(
+        "Cannot create user personal access token without a user ID",
+      );
+    }
+    // Tokens take super admin from the user record, not from this login
+    const user = await getUserById(userId);
+    if (normalizeSuperAdmin(user?.superAdmin) && !req.superAdmin) {
+      throw new Error(
+        "Super admins must sign in with a method that grants super admin access to create personal access tokens.",
+      );
+    }
+    key = await context.models.apiKeys.createUserPersonalAccessApiKey({
+      description,
+      userId: userId,
+      scopedRole,
+      limitAccessByEnvironment,
+      environments,
+      additionalRoles,
+      projectRoles,
+      expiresAt,
+      confirmRules,
+    });
+  }
+  // Handle organization secret tokens
+  else {
+    key = await context.models.apiKeys.createOrganizationApiKey({
+      description,
+      roleId: type,
+      limitAccessByEnvironment,
+      environments,
+      additionalRoles,
+      projectRoles,
+      actAs,
+      expiresAt,
+      confirmRules,
+    });
+  }
+
+  await req.audit({
+    event: "apiKey.create",
+    entity: {
+      object: "apiKey",
+      id: key.id || "",
+      name: key.description,
+    },
+    details: auditDetailsCreate(ApiKeyModel.toAuditDetails(key)),
+  });
+
+  return res.status(200).json({
+    status: 200,
+    key,
+  });
+}
+
+export async function putApiKey(
+  req: AuthRequest<
+    {
+      role?: string;
+      scopedRole?: string;
+      description?: string;
+      limitAccessByEnvironment?: boolean;
+      environments?: string[];
+      additionalRoles?: ApiKeyInterface["additionalRoles"];
+      projectRoles?: ApiKeyInterface["projectRoles"];
+      actAs?: ApiKeyInterface["actAs"];
+      expiresAt?: string | null;
+      confirmRules?: ConfirmRule[] | null;
+    },
+    { id: string }
+  >,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+  const {
+    role,
+    scopedRole,
+    description,
+    limitAccessByEnvironment,
+    environments,
+    additionalRoles,
+    projectRoles,
+    actAs,
+    expiresAt,
+    confirmRules,
+  } = req.body;
+
+  // The model returns both the pre- and post-update docs from a single read so
+  // the audit log can diff the permission scope. If the key doesn't exist the
+  // model throws, so there is always a before-state here.
+  const { before, after } =
+    await context.models.apiKeys.updateSecretApiKeyPermissions(id, {
+      role,
+      scopedRole,
+      description,
+      limitAccessByEnvironment,
+      environments,
+      additionalRoles,
+      projectRoles,
+      actAs,
+      expiresAt:
+        expiresAt === undefined ? undefined : parseExpiresAt(expiresAt),
+      confirmRules,
+    });
+
+  await req.audit({
+    event: "apiKey.update",
+    entity: {
+      object: "apiKey",
+      id,
+      name: after.description,
+    },
+    details: auditDetailsUpdate(
+      ApiKeyModel.toAuditDetails(before),
+      ApiKeyModel.toAuditDetails(after),
+    ),
+  });
+
+  res.status(200).json({ status: 200 });
+}
+
+export async function deleteApiKey(
+  req: AuthRequest<{ key?: string; id?: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  // Old API keys did not have an id, so we need to delete by the key value itself
+  const { key, id } = req.body;
+  if (!key && !id) {
+    throw new Error("Must provide either an API key or id in order to delete");
+  }
+
+  const deleted = await context.models.apiKeys.deleteByIdOrKey(
+    id || undefined,
+    key || undefined,
+  );
+
+  await req.audit({
+    event: "apiKey.delete",
+    entity: {
+      object: "apiKey",
+      id: deleted.id || "",
+      name: deleted.description,
+    },
+    details: auditDetailsDelete(ApiKeyModel.toAuditDetails(deleted)),
+  });
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putApiKeyDisabled(
+  req: AuthRequest<{ disabled: boolean }, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+  const { disabled } = req.body;
+
+  // `setDisabled` returns both the pre- and post-update docs so we can log the
+  // before/after state from the real persisted doc.
+  const { before, after } = await context.models.apiKeys.setDisabled(
+    id,
+    disabled,
+  );
+
+  await req.audit({
+    event: disabled ? "apiKey.disable" : "apiKey.enable",
+    entity: {
+      object: "apiKey",
+      id: after.id || "",
+      name: after.description,
+    },
+    details: auditDetailsUpdate(
+      ApiKeyModel.toAuditDetails(before),
+      ApiKeyModel.toAuditDetails(after),
+    ),
+  });
+
+  res.status(200).json({ status: 200 });
+}
+
+export async function postApiKeyRotate(
+  req: AuthRequest<{ gracePeriodHours: number }, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  const { before, after } = await context.models.apiKeys.rotateSecret(
+    id,
+    req.body.gracePeriodHours,
+  );
+
+  await req.audit({
+    event: "apiKey.rotate",
+    entity: {
+      object: "apiKey",
+      id,
+      name: after.description,
+    },
+    details: auditDetailsUpdate(
+      ApiKeyModel.toAuditDetails(before),
+      ApiKeyModel.toAuditDetails(after),
+    ),
+  });
+
+  res.status(200).json({
+    status: 200,
+    key: after.key,
+    expiresAt: after.expiresAt ?? null,
+    // An immediate rotation keeps the old secret, already expired.
+    previousKeyExpiresAt: isExpired(after.previousKeyExpiresAt)
+      ? null
+      : (after.previousKeyExpiresAt ?? null),
+  });
+}
+
+export async function deleteApiKeyPreviousKey(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  const { before, after } = await context.models.apiKeys.revokePreviousKey(id);
+
+  await req.audit({
+    event: "apiKey.update",
+    entity: {
+      object: "apiKey",
+      id,
+      name: after.description,
+    },
+    details: auditDetailsUpdate(
+      ApiKeyModel.toAuditDetails(before),
+      ApiKeyModel.toAuditDetails(after),
+    ),
+  });
+
+  res.status(200).json({ status: 200 });
+}
+
+export async function postApiKeyReveal(
+  req: AuthRequest<{ id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.body;
+
+  const key = await context.models.apiKeys.getUnredactedSecretKey(id);
+  if (!key) {
+    return res.status(403).json({
+      status: 403,
+    });
+  }
+
+  if (!canManageApiKeySecret(context.permissions, key, context.userId)) {
+    if (!key.userId) context.permissions.throwPermissionError();
+    return res.status(403).json({
+      status: 403,
+    });
+  }
+
+  res.status(200).json({
+    status: 200,
+    key,
+  });
+}
+
+export async function getLegacyWebhooks(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+  const webhooks = await context.models.sdkWebhooks.findAllLegacySdkWebhooks();
+
+  res.status(200).json({
+    status: 200,
+    webhooks: webhooks.filter((webhook) =>
+      context.permissions.canReadSingleProjectResource(webhook.project),
+    ),
+  });
+}
+
+export async function testSDKWebhook(
+  req: AuthRequest<Record<string, unknown>, { id: string }>,
+  res: Response,
+) {
+  const webhookId = req.params.id;
+
+  const context = getContextFromReq(req);
+  const webhook = await context.models.sdkWebhooks.getById(webhookId);
+  if (!webhook) {
+    throw new Error("Could not find webhook");
+  }
+
+  const conns = await findSDKConnectionsByIds(context, webhook.sdks);
+  if (!conns.length) {
+    throw new Error("Could not find any SDK connection tied to this webhook");
+  }
+
+  if (!conns.every((c) => context.permissions.canUpdateSDKWebhook(c))) {
+    context.permissions.throwPermissionError();
+  }
+
+  await fireSdkWebhook(context, webhook).catch(() => {
+    // Do nothing, already being logged in Mongo
+  });
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putSDKWebhook(
+  req: AuthRequest<UpdateSdkWebhookProps, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  const { id } = req.params;
+  const webhook = await context.models.sdkWebhooks.getById(id);
+  if (!webhook) {
+    throw new Error("Could not find webhook");
+  }
+
+  const conns = await findSDKConnectionsByIds(context, webhook.sdks);
+  if (!conns.length) {
+    throw new Error("Could not find any SDK connection tied to this webhook");
+  }
+
+  if (!conns.every((c) => context.permissions.canUpdateSDKWebhook(c))) {
+    context.permissions.throwPermissionError();
+  }
+
+  const parsedUpdates = updateSdkWebhookValidator.parse(req.body);
+
+  // Reset failure state when endpoint changes
+  const resetFields =
+    parsedUpdates.endpoint && parsedUpdates.endpoint !== webhook.endpoint
+      ? { consecutiveFailures: 0, disabled: false }
+      : {};
+
+  const updatedWebhook = await context.models.sdkWebhooks.update(webhook, {
+    ...parsedUpdates,
+    ...resetFields,
+  });
+
+  // Fire the webhook now that it has changed
+  fireSdkWebhook(context, updatedWebhook).catch(() => {
+    // Do nothing, already being logged in Mongo
+  });
+  res.status(200).json({
+    status: 200,
+    webhook: updatedWebhook,
+  });
+}
+
+export async function deleteLegacyWebhook(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageLegacySDKWebhooks()) {
+    context.permissions.throwPermissionError();
+  }
+  const { id } = req.params;
+  await context.models.sdkWebhooks.deleteLegacySdkWebhookById(id);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function deleteSDKWebhook(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  const webhook = await context.models.sdkWebhooks.getById(id);
+  if (webhook) {
+    // It's ok if conns is empty here
+    // We still want to allow deleting orphaned webhooks
+    const conns = await findSDKConnectionsByIds(context, webhook.sdks);
+    if (!conns.every((c) => context.permissions.canDeleteSDKWebhook(c))) {
+      context.permissions.throwPermissionError();
+    }
+  }
+
+  await context.models.sdkWebhooks.deleteById(id);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function postImportConfig(
+  req: AuthRequest<{
+    contents: string;
+  }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageOrgSettings()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { contents } = req.body;
+
+  const config: ConfigFile = JSON.parse(contents);
+  if (!config) {
+    throw new Error("Failed to parse config.yml file contents.");
+  }
+
+  await importConfig(context, config);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function getOrphanedUsers(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageOrgSettings()) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (IS_CLOUD) {
+    throw new Error("Unable to get orphaned users on TestRing Cloud");
+  }
+
+  if (IS_MULTI_ORG && !hasSuperAdminPermission(req.superAdmin, "users")) {
+    throw new Error(
+      "Only super admins get orphaned users on multi-org deployments",
+    );
+  }
+
+  const allUsers = await getAllUsers();
+  const { organizations: allOrgs } = await findAllOrganizations(1, "");
+
+  const membersInOrgs = new Set<string>();
+  allOrgs.forEach((org) => {
+    org.members.forEach((m) => {
+      membersInOrgs.add(m.id);
+    });
+  });
+
+  const orphanedUsers = allUsers
+    .filter((u) => !membersInOrgs.has(u.id))
+    .map(({ id, name, email }) => ({
+      id,
+      name,
+      email,
+    }));
+
+  return res.status(200).json({
+    status: 200,
+    orphanedUsers,
+  });
+}
+
+export async function addOrphanedUser(
+  req: AuthRequest<MemberRoleWithProjects, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageOrgSettings()) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (IS_CLOUD) {
+    throw new Error("This action is not permitted on TestRing Cloud");
+  }
+
+  if (IS_MULTI_ORG && !hasSuperAdminPermission(req.superAdmin, "users")) {
+    throw new Error(
+      "Only super admins can add orphaned users on multi-org deployments",
+    );
+  }
+
+  const { org } = context;
+
+  const { id } = req.params;
+  const {
+    role,
+    environments,
+    limitAccessByEnvironment,
+    projectRoles,
+    additionalRoles,
+  } = req.body;
+
+  // Make sure user exists
+  const user = await getUserById(id);
+  if (!user) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot find user with that id",
+    });
+  }
+
+  // Make sure user is actually orphaned
+  const orgs = await findOrganizationsByMemberId(id);
+  if (orgs.length) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot add users who are already part of an organization",
+    });
+  }
+
+  // Make sure role is valid
+  try {
+    assertMemberRoleInfoValid(org, {
+      role,
+      limitAccessByEnvironment,
+      environments,
+      projectRoles,
+      additionalRoles,
+    });
+    await assertProjectRulesReferenceProjects(context, undefined, projectRoles);
+  } catch (e) {
+    return res.status(400).json({
+      status: 400,
+      message: e.message,
+    });
+  }
+
+  try {
+    assertRoleAssignmentAllowed(org, role);
+  } catch (e) {
+    return res.status(e.status || 400).json({
+      status: e.status || 400,
+      message: e.message,
+    });
+  }
+
+  await addMemberToOrg({
+    organization: org,
+    userId: id,
+    role,
+    environments,
+    limitAccessByEnvironment,
+    projectRoles,
+    additionalRoles,
+  });
+
+  return res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function deleteOrphanedUser(
+  req: AuthRequest<unknown, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageOrgSettings()) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (IS_CLOUD) {
+    throw new Error("Unable to delete orphaned users on TestRing Cloud");
+  }
+
+  if (IS_MULTI_ORG && !hasSuperAdminPermission(req.superAdmin, "users")) {
+    throw new Error(
+      "Only super admins delete orphaned users on multi-org deployments",
+    );
+  }
+
+  const { id } = req.params;
+
+  // Make sure user exists
+  const user = await getUserById(id);
+  if (!user) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot find user with that id",
+    });
+  }
+
+  // A less privileged admin must not be able to remove a super admin
+  if (!holdsAllSuperAdminPermissions(req.superAdmin, user.superAdmin)) {
+    return res.status(403).json({
+      status: 403,
+      message: "You cannot delete a user with more super admin access than you",
+    });
+  }
+
+  // Make sure user is orphaned
+  const orgs = await findOrganizationsByMemberId(id);
+  if (orgs.length) {
+    return res.status(400).json({
+      status: 400,
+      message: "Cannot delete users who are part of an organization",
+    });
+  }
+
+  await deleteUser(id);
+  return res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putAdminResetUserPassword(
+  req: AuthRequest<
+    {
+      userToUpdateId: string;
+      updatedPassword: string;
+    },
+    {
+      id: string;
+    }
+  >,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageOrgSettings()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { updatedPassword } = req.body;
+  const userToUpdateId = req.params.id;
+
+  // Only enable for self-hosted deployments that are not using SSO
+  if (usingOpenId()) {
+    throw new Error("This functionality is not available when using SSO");
+  }
+
+  const { org } = getContextFromReq(req);
+  const isUserToUpdateInSameOrg = org.members.find(
+    (member) => member.id === userToUpdateId,
+  );
+
+  // Only update the password if the member we're updating is in the same org as the requester
+  // Exception: allow updating the password if the user is not part of any organization
+  if (!isUserToUpdateInSameOrg) {
+    const orgs = await findOrganizationsByMemberId(userToUpdateId);
+    if (orgs.length > 0) {
+      throw new Error(
+        "Cannot change password of users outside your organization.",
+      );
+    }
+  }
+
+  await updatePassword(userToUpdateId, updatedPassword);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putLicenseKey(
+  req: AuthRequest<{ licenseKey: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  const { org } = context;
+  const orgId = org?.id;
+  if (!orgId) {
+    throw new Error("Must be part of an organization");
+  }
+
+  if (!context.permissions.canManageBilling()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const licenseKey = req.body.licenseKey.trim();
+  if (!licenseKey) {
+    throw new Error("missing license key");
+  }
+
+  await setLicenseKey(org, licenseKey);
+
+  try {
+    await updateOrganization(orgId, {
+      licenseKey,
+    });
+  } catch (e) {
+    throw new Error("Failed to save license key");
+  }
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putDefaultRole(
+  req: AuthRequest<{ defaultRole: MemberRoleWithProjects }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const { defaultRole } = req.body;
+
+  await assertCanUpdateDefaultRole(context, defaultRole);
+
+  await updateOrganization(org.id, {
+    settings: {
+      ...org.settings,
+      defaultRole,
+    },
+  });
+
+  try {
+    await req.audit({
+      event: "organization.update",
+      entity: {
+        object: "organization",
+        id: org.id,
+      },
+      details: auditDetailsUpdate(
+        { settings: { defaultRole: org.settings?.defaultRole } },
+        { settings: { defaultRole } },
+      ),
+    });
+  } catch (e) {
+    // The role is already saved; don't report the update as failed
+    req.log.error(e, "Failed to audit default role update");
+  }
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putGetStartedChecklistItem(
+  req: AuthRequest<{
+    checklistItem: string;
+    project: string;
+  }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const { checklistItem, project } = req.body;
+
+  if (checklistItem !== "environments" && checklistItem !== "attributes") {
+    throw new Error("Unexpected Get Started checklist item.");
+  }
+
+  if (
+    checklistItem === "environments" &&
+    !context.permissions.canCreateEnvironment({
+      id: "",
+      projects: [project],
+    })
+  ) {
+    context.permissions.throwPermissionError();
+  }
+
+  if (
+    checklistItem === "attributes" &&
+    !context.permissions.canCreateAttribute({
+      projects: [project],
+    })
+  ) {
+    context.permissions.throwPermissionError();
+  }
+
+  addGetStartedChecklistItem(org.id, checklistItem);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putSetupEventTracker(
+  req: AuthRequest<{
+    eventTracker: string;
+  }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { org } = context;
+  const { eventTracker } = req.body;
+
+  try {
+    await updateOrganization(org.id, {
+      setupEventTracker: eventTracker,
+    });
+  } catch (e) {
+    throw new Error("Failed to save setup event tracker");
+  }
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function postCustomRole(req: AuthRequest<Role>, res: Response) {
+  const context = getContextFromReq(req);
+  const roleToAdd = req.body;
+
+  if (!context.hasPremiumFeature("custom-roles")) {
+    throw new Error("Must have an Enterprise License Key to use custom roles.");
+  }
+
+  if (!context.permissions.canManageCustomRoles()) {
+    context.permissions.throwPermissionError();
+  }
+
+  await addCustomRole(context.org, roleToAdd);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function putCustomRole(
+  req: AuthRequest<Omit<Role, "id">, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const roleToUpdate = req.body;
+  const { id } = req.params;
+
+  if (!context.hasPremiumFeature("custom-roles")) {
+    throw new Error("Must have an Enterprise License Key to use custom roles.");
+  }
+
+  if (!context.permissions.canManageCustomRoles()) {
+    context.permissions.throwPermissionError();
+  }
+
+  await editCustomRole(context.org, id, roleToUpdate);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function deleteCustomRole(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  if (!context.hasPremiumFeature("custom-roles")) {
+    throw new Error("Must have an Enterprise License Key to use custom roles.");
+  }
+
+  if (!context.permissions.canManageCustomRoles()) {
+    context.permissions.throwPermissionError();
+  }
+
+  await removeCustomRole(context, id);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function deactivateRole(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  // Only orgs with custom-roles feature can deactivate roles
+  if (!context.hasPremiumFeature("custom-roles")) {
+    throw new Error("Must have an Enterprise License Key to use custom roles.");
+  }
+
+  if (!context.permissions.canManageCustomRoles()) {
+    context.permissions.throwPermissionError();
+  }
+
+  await deactivateRoleById(context.org, id);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function activateRole(
+  req: AuthRequest<null, { id: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+  const { id } = req.params;
+
+  // Only orgs with custom-roles feature can activate roles
+  if (!context.hasPremiumFeature("custom-roles")) {
+    throw new Error("Must have an Enterprise License Key to use custom roles.");
+  }
+
+  if (!context.permissions.canManageCustomRoles()) {
+    context.permissions.throwPermissionError();
+  }
+
+  await activateRoleById(context.org, id);
+
+  res.status(200).json({
+    status: 200,
+  });
+}
+
+export async function postAgreeToAgreement(
+  req: AuthRequest<{ agreement: AgreementType; version: string }>,
+  res: Response,
+) {
+  const context = getContextFromReq(req);
+
+  if (!context.permissions.canManageOrgSettings()) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { agreement, version } = req.body;
+  try {
+    const existing =
+      await context.models.agreements.getAgreementForOrg(agreement);
+    if (existing) {
+      // hard to get into this state, but if the user/org has already agreed to this agreement, we can just return success
+      return res.status(200).json({ status: 200 });
+    }
+    // there is no existing agreement, so we create a new one
+    await context.models.agreements.create({
+      agreement,
+      version,
+      userId: context.userId,
+      userName: context.userName,
+      userEmail: context.email,
+      dateSigned: new Date(),
+    });
+    return res.status(200).json({
+      status: 200,
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 500, message: e.message });
+  }
+}
+
+export async function getFeatureExpUsage(req: AuthRequest, res: Response) {
+  const context = getContextFromReq(req);
+  const hasFeatures = await hasNonDemoFeature(context);
+  const hasExperiments = await hasNonDemoExperiment(context);
+
+  return res.status(200).json({
+    status: 200,
+    hasFeatures,
+    hasExperiments,
+  });
+}

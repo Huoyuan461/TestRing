@@ -1,0 +1,107 @@
+import { z } from "zod";
+import { ownerEmailField } from "./owner-field";
+import { queryRunnerFailureCause } from "./queries";
+
+export const autoUpdateFailed = z
+  .object({
+    type: z.literal("auto-update"),
+    success: z.boolean(),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    experimentId: z.string(),
+  })
+  .strict();
+
+export const multipleExposures = z
+  .object({
+    type: z.literal("multiple-exposures"),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    experimentId: z.string(),
+    usersCount: z.number(),
+    percent: z.number(),
+  })
+  .strict();
+
+export const srmVariationBalance = z
+  .object({
+    name: z.string(),
+    users: z.number(),
+    // Configured traffic share for the phase (normalize against the sum).
+    weight: z.number(),
+  })
+  .strict();
+
+export const srm = z
+  .object({
+    type: z.literal("srm"),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    experimentId: z.string(),
+    threshold: z.number(),
+    // Evidence captured at emission time. Absent on events emitted before
+    // these fields existed.
+    pValue: z.number().optional(),
+    variations: z.array(srmVariationBalance).optional(),
+    // Whole days the current phase had been running when the alert fired.
+    durationDays: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+
+export const noData = z
+  .object({
+    type: z.literal("no-data"),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    experimentId: z.string(),
+  })
+  .strict();
+
+export const scheduledStatusUpdateFailed = z
+  .object({
+    type: z.literal("scheduled-status-update-failed"),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    experimentId: z.string(),
+    // "start" | "stop" — which scheduled transition failed.
+    scheduledStatusUpdateType: z.enum(["start", "stop"]),
+    attempts: z.number().int().positive(),
+    maxAttempts: z.number().int().positive(),
+    // false once we've hit the retry cap and cleared `nextScheduledStatusUpdate`.
+    willRetry: z.boolean(),
+    reason: z.string(),
+  })
+  .strict();
+
+export const underpowered = z
+  .object({
+    type: z.literal("underpowered"),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    experimentId: z.string(),
+  })
+  .strict();
+
+export const updateFailed = z
+  .object({
+    type: z.literal("update-failed"),
+    experimentId: z.string(),
+    experimentName: z.string(),
+    ownerEmail: ownerEmailField,
+    cause: queryRunnerFailureCause.exclude(["cancelled"]),
+  })
+  .strict();
+
+export const experimentWarningNotificationPayload = z.union([
+  autoUpdateFailed,
+  updateFailed,
+  multipleExposures,
+  srm,
+  noData,
+  scheduledStatusUpdateFailed,
+  underpowered,
+]);
+
+export type ExperimentWarningNotificationPayload = z.infer<
+  typeof experimentWarningNotificationPayload
+>;

@@ -1,0 +1,598 @@
+import stringify from "json-stringify-pretty-compact";
+import { ReactNode, useContext, useMemo, useRef } from "react";
+import { FeaturePrerequisite, SavedGroupTargeting } from "shared/types/feature";
+import { getMalformedPrereqConditionError, isDefined } from "shared/util";
+import { SavedGroupWithoutValues } from "shared/types/saved-group";
+import { Box, Flex } from "@radix-ui/themes";
+import { useDefinitions } from "@/services/DefinitionsContext";
+import { Condition, jsonToConds, useAttributeMap } from "@/services/features";
+import Tooltip from "@/components/Tooltip/Tooltip";
+import { Popover } from "@/ui/Popover";
+import InlineCode from "@/components/SyntaxHighlighting/InlineCode";
+import VirtualizedCode, {
+  isLongCode,
+  RenderInFullContext,
+} from "@/components/SyntaxHighlighting/VirtualizedCode";
+import { FeatureBadge } from "@/components/Features/FeatureBadge";
+import { PlainEntityBadge } from "@/components/Features/EntityBadge";
+import { SavedGroupBadge } from "@/components/Features/SavedGroupBadge";
+import Text from "@/ui/Text";
+import { AttributeBadge } from "@/components/Features/AttributeBadge";
+import SavedGroupTargetingDisplay from "@/components/Features/SavedGroupTargetingDisplay";
+import InvalidPrereqConditionBadge from "@/components/Features/InvalidPrereqConditionBadge";
+import ValueGroup from "@/components/Features/ValueGroup";
+import styles from "./ConditionDisplay.module.scss";
+
+type ConditionWithParentId = Condition & { parentId?: string };
+
+function operatorToText({
+  operator,
+  isPrerequisite,
+  hasMultipleSavedGroups,
+  isSavedGroupField,
+}: {
+  operator: string;
+  isPrerequisite?: boolean;
+  hasMultipleSavedGroups?: boolean;
+  isSavedGroupField?: boolean;
+}): string {
+  switch (operator) {
+    case "$eq":
+    case "$veq":
+      return `=`;
+    case "$ne":
+    case "$vne":
+      return `≠`;
+    case "$includes":
+      return `includes`;
+    case "$notIncludes":
+      return `does not include`;
+    case "$empty":
+      return `is empty`;
+    case "$notEmpty":
+      return `is not empty`;
+    case "$lt":
+    case "$vlt":
+      return `<`;
+    case "$lte":
+    case "$vlte":
+      return `≤`;
+    case "$gt":
+    case "$vgt":
+      return `>`;
+    case "$gte":
+    case "$vgte":
+      return `≥`;
+    case "$exists":
+      return isPrerequisite ? `is live` : `is not NULL`;
+    case "$notExists":
+      return isPrerequisite ? `is not live` : `is NULL`;
+    case "$in":
+      return `is any of`;
+    case "$nin":
+      return `is none of`;
+    case "$ini":
+      return `is any of (case insensitive)`;
+    case "$nini":
+      return `is none of (case insensitive)`;
+    case "$inGroup":
+      return `${isSavedGroupField ? "user " : ""}is in ${hasMultipleSavedGroups ? "all" : "the"} saved group${hasMultipleSavedGroups ? "s" : ""}`;
+    case "$notInGroup":
+      return `${isSavedGroupField ? "user " : ""}is not in the saved group${hasMultipleSavedGroups ? "s" : ""}`;
+    case "$true":
+      return "is";
+    case "$false":
+      return "is";
+    case "$regex":
+      return `matches regex`;
+    case "$notRegex":
+      return `does not match regex`;
+    case "$regexi":
+      return `matches regex (case insensitive)`;
+    case "$notRegexi":
+      return `does not match regex (case insensitive)`;
+  }
+  return operator;
+}
+
+function needsValue(operator: string) {
+  return !["$exists", "$notExists", "$empty", "$notEmpty"].includes(operator);
+}
+function hasMultiValues(operator: string) {
+  return ["$in", "$nin", "$ini", "$nini"].includes(operator);
+}
+function getValue(
+  operator: string,
+  value: string,
+  savedGroups?: SavedGroupWithoutValues[],
+): string {
+  if (operator === "$true") return "TRUE";
+  if (operator === "$false") return "FALSE";
+
+  // Get the groupName from the associated group.id to display a human readable name.
+  if ((operator === "$inGroup" || operator === "$notInGroup") && savedGroups) {
+    const index = savedGroups.find((i) => i.id === value);
+    return index?.groupName || "Group was Deleted";
+  }
+  return value;
+}
+
+const MULTI_VALUE_LIMIT = 3;
+
+// A long condition shown as JSON scrolls inside a bounded box, highlighting
+// only the visible lines
+function ConditionJson({ code }: { code: string }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const renderInFull = useContext(RenderInFullContext);
+  if (renderInFull || !isLongCode(code)) {
+    return <InlineCode language="json" code={code} />;
+  }
+  return (
+    <Box ref={scrollRef} style={{ maxHeight: 400, overflowY: "auto" }}>
+      <VirtualizedCode scrollRef={scrollRef} language="json" code={code} />
+    </Box>
+  );
+}
+
+export function MultiValuesDisplay({
+  values,
+  displayMap,
+  savedGroupIds,
+}: {
+  values: string[];
+  displayMap?: Record<string, string>;
+  savedGroupIds?: Set<string>;
+}) {
+  const { getSavedGroupById } = useDefinitions();
+
+  return (
+    <>
+      {values.slice(0, MULTI_VALUE_LIMIT).map((v, i) => {
+        const isSavedGroup = savedGroupIds?.has(v);
+        const group = isSavedGroup ? getSavedGroupById(v) : null;
+
+        const displayValue =
+          isSavedGroup && group
+            ? displayMap?.[v] || group.groupName
+            : displayMap?.[v] || v;
+        return isSavedGroup && group ? (
+          <SavedGroupBadge
+            key={i}
+            groupId={group.id}
+            groupName={displayValue}
+          />
+        ) : (
+          <PlainEntityBadge key={i} label={displayValue} maxWidth={300} />
+        );
+      })}
+      {values.length > MULTI_VALUE_LIMIT && (
+        // A list can run to thousands of ids: one wrapped, scrollable block
+        <Popover
+          openOnHover
+          side="bottom"
+          align="start"
+          contentStyle={{ maxWidth: 480, maxHeight: 240, overflowY: "auto" }}
+          trigger={
+            <span className="mr-1">
+              <em>+ {values.length - MULTI_VALUE_LIMIT} more</em>
+            </span>
+          }
+          content={
+            <Text size="sm" color="text-mid">
+              {values
+                .slice(MULTI_VALUE_LIMIT)
+                .map((v) => {
+                  const group = savedGroupIds?.has(v)
+                    ? getSavedGroupById(v)
+                    : null;
+                  return group ? group.groupName : displayMap?.[v] || v;
+                })
+                .join(", ")}
+            </Text>
+          }
+        />
+      )}
+    </>
+  );
+}
+
+function MultiValueDisplay({
+  value,
+  displayMap,
+  noParensForSingleValue = false,
+  savedGroupIds,
+}: {
+  value: string;
+  displayMap?: Record<string, string>;
+  noParensForSingleValue?: boolean;
+  savedGroupIds?: Set<string>;
+}) {
+  const parts = value
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+
+  const skipParens = noParensForSingleValue && parts.length <= 1;
+
+  if (!parts.length) {
+    return (
+      <Text>
+        <em>empty list</em>
+      </Text>
+    );
+  }
+  return (
+    <ValueGroup parens={!skipParens}>
+      <MultiValuesDisplay
+        values={parts}
+        displayMap={displayMap}
+        savedGroupIds={savedGroupIds}
+      />
+    </ValueGroup>
+  );
+}
+
+function getConditionOrParts({
+  conditions,
+  savedGroups,
+  attributeIds,
+  initialAnd = false,
+  renderPrerequisite = false,
+  keyPrefix = "",
+  prefix,
+}: {
+  conditions: ConditionWithParentId[][];
+  savedGroups?: SavedGroupWithoutValues[];
+  attributeIds: Set<string>;
+  initialAnd?: boolean;
+  renderPrerequisite?: boolean;
+  keyPrefix?: string;
+  prefix?: ReactNode;
+}) {
+  if (conditions.length === 0) return [];
+  if (conditions.length === 1) {
+    return getConditionParts({
+      conditions: conditions[0],
+      savedGroups,
+      attributeIds,
+      initialAnd,
+      renderPrerequisite,
+      keyPrefix,
+      prefix,
+    });
+  }
+
+  const parts: ReactNode[] = [];
+
+  // Add prefix before OR groups if present and not initialAnd
+  if (prefix && !initialAnd) {
+    parts.push(<div key={keyPrefix + "prefix"}>{prefix}</div>);
+  }
+
+  if (initialAnd) {
+    parts.push(
+      <div key={keyPrefix + "and-start"}>
+        {prefix}
+        <Text weight="medium">AND {"["}</Text>
+      </div>,
+    );
+  }
+
+  conditions.forEach((condGroup, i) => {
+    if (i > 0) {
+      parts.push(
+        <Text weight="medium" key={keyPrefix + "or-sep-" + i}>
+          OR
+        </Text>,
+      );
+    }
+
+    const groupContent = getConditionParts({
+      conditions: condGroup,
+      savedGroups,
+      attributeIds,
+      initialAnd: false,
+      renderPrerequisite,
+      keyPrefix: `${keyPrefix}or-${i}-`,
+    });
+
+    parts.push(
+      <Box
+        key={keyPrefix + "or-group-" + i}
+        pl="3"
+        style={{
+          borderLeft: "2px solid var(--gray-6)",
+        }}
+      >
+        <Flex direction="column" gap="1">
+          {groupContent}
+        </Flex>
+      </Box>,
+    );
+  });
+
+  if (initialAnd) {
+    parts.push(
+      <div key={keyPrefix + "and-end"}>
+        <Text weight="medium">{"]"}</Text>
+      </div>,
+    );
+  }
+
+  return parts;
+}
+
+function getConditionParts({
+  conditions,
+  savedGroups,
+  attributeIds,
+  initialAnd = false,
+  renderPrerequisite = false,
+  keyPrefix = "",
+  prefix,
+}: {
+  conditions: ConditionWithParentId[];
+  savedGroups?: SavedGroupWithoutValues[];
+  attributeIds: Set<string>;
+  initialAnd?: boolean;
+  renderPrerequisite?: boolean;
+  keyPrefix?: string;
+  prefix?: ReactNode;
+}) {
+  return conditions.map(({ field, operator, value, parentId }, i) => {
+    let fieldEl: ReactNode = attributeIds.has(field) ? (
+      <AttributeBadge attributeId={field} />
+    ) : (
+      <PlainEntityBadge label={field} />
+    );
+    let parentIdEl: ReactNode = null;
+    if (renderPrerequisite) {
+      if (field === "value") {
+        fieldEl = null;
+      } else if (field.substring(0, 6) === "value.") {
+        const displayValue = field.substring(6);
+        fieldEl = <PlainEntityBadge label={displayValue} maxWidth={300} />;
+      } else {
+        fieldEl = (
+          <Tooltip
+            className="mr-1 border px-2 alert-danger rounded text-danger"
+            body={
+              <>
+                Prerequisite targeting conditions must reference{" "}
+                <code>value</code> as the root element
+              </>
+            }
+          >
+            {field}
+          </Tooltip>
+        );
+      }
+      if (parentId) {
+        parentIdEl = (
+          <>
+            <Text>prerequisite</Text>
+            <FeatureBadge featureId={parentId} />
+          </>
+        );
+      }
+    }
+
+    // For saved groups, hide the "field" element and tweak the operator
+    if (field === "$savedGroups" || field === "$notSavedGroups") {
+      fieldEl = null;
+      if (field === "$savedGroups" && operator === "$in") {
+        operator = "$inGroup";
+      } else if (field === "$notSavedGroups" && operator === "$nin") {
+        operator = "$notInGroup";
+      }
+    }
+
+    const savedGroupValueParts =
+      field === "$savedGroups" || field === "$notSavedGroups"
+        ? value
+            .split(",")
+            .map((v) => v.trim())
+            .filter(Boolean)
+        : [];
+    const hasMultipleSavedGroups = savedGroupValueParts.length > 1;
+
+    // Extract variables for saved group value display
+    const group =
+      (operator === "$inGroup" || operator === "$notInGroup") && savedGroups
+        ? savedGroups.find((sg) => sg.id === value)
+        : undefined;
+    const displayValue = getValue(operator, value, savedGroups);
+
+    return (
+      <Flex wrap="wrap" key={keyPrefix + i} gap="2">
+        {i === 0 && prefix}
+        {(i > 0 || initialAnd) && <Text weight="medium">AND</Text>}
+        {parentIdEl}
+        {fieldEl}
+        <Text>
+          {operatorToText({
+            operator,
+            isPrerequisite: renderPrerequisite,
+            hasMultipleSavedGroups,
+            isSavedGroupField:
+              field === "$savedGroups" || field === "$notSavedGroups",
+          })}
+        </Text>
+        {field === "$savedGroups" || field === "$notSavedGroups" ? (
+          <MultiValueDisplay
+            value={value}
+            displayMap={Object.fromEntries(
+              (savedGroups || []).map((sg) => [sg.id, sg.groupName]),
+            )}
+            noParensForSingleValue={true}
+            savedGroupIds={
+              new Set(
+                value
+                  .split(",")
+                  .map((v) => v.trim())
+                  .filter(Boolean),
+              )
+            }
+          />
+        ) : hasMultiValues(operator) ? (
+          <MultiValueDisplay value={value} />
+        ) : needsValue(operator) ? (
+          (operator === "$inGroup" || operator === "$notInGroup") &&
+          savedGroups ? (
+            group ? (
+              <SavedGroupBadge groupId={group.id} groupName={group.groupName} />
+            ) : (
+              <PlainEntityBadge label={displayValue} />
+            )
+          ) : (
+            <PlainEntityBadge label={displayValue} maxWidth={300} />
+          )
+        ) : (
+          ""
+        )}
+      </Flex>
+    );
+  });
+}
+
+export default function ConditionDisplay({
+  condition,
+  savedGroups: savedGroupTargeting,
+  prerequisites,
+  prefix,
+  variant = "default",
+}: {
+  condition?: string;
+  savedGroups?: SavedGroupTargeting[];
+  prerequisites?: FeaturePrerequisite[];
+  prefix?: ReactNode;
+  // "rows" sits each part on a 28px row, in the field text color.
+  variant?: "default" | "rows";
+}) {
+  const rows = variant === "rows";
+  const { savedGroups } = useDefinitions();
+  const attributes = useAttributeMap();
+  const attributeIds = useMemo(() => new Set(attributes.keys()), [attributes]);
+
+  const parts: ReactNode[] = [];
+  let partId = 0;
+  let prefixUsed = false;
+
+  const jsonFormattedCondition = useMemo(() => {
+    if (!condition) return;
+    try {
+      const parsed = JSON.parse(condition);
+      return stringify(parsed);
+    } catch (e) {
+      console.error(e);
+      return condition;
+    }
+  }, [condition]);
+
+  if (savedGroupTargeting && savedGroupTargeting.length > 0) {
+    parts.push(
+      <SavedGroupTargetingDisplay
+        savedGroups={savedGroupTargeting}
+        groupClassName={rows ? undefined : "col-auto"}
+        initialAnd={false}
+        key={`${partId++}-saved-group-targeting`}
+        prefix={!prefixUsed ? prefix : undefined}
+      />,
+    );
+    prefixUsed = true;
+  }
+
+  if (prerequisites) {
+    const prereqConditionsGrouped = prerequisites
+      .map((p) => {
+        const cond = jsonToConds(p.condition);
+        if (
+          !cond ||
+          cond.length > 1 ||
+          getMalformedPrereqConditionError(p.condition)
+        ) {
+          let jsonFormattedCondition = p.condition;
+          try {
+            const parsed = JSON.parse(p.condition);
+            jsonFormattedCondition = stringify(parsed);
+          } catch (e) {
+            console.error(e, p.condition);
+          }
+          parts.push(
+            <Flex wrap="wrap" gap="2" key={partId++} className="w-100 col-auto">
+              {!prefixUsed && prefix}
+              {prefixUsed && <Text weight="medium">AND</Text>}
+              <Text>prerequisite</Text>
+              <FeatureBadge featureId={p.id} />
+              <ConditionJson code={jsonFormattedCondition} />
+              <InvalidPrereqConditionBadge condition={p.condition} />
+            </Flex>,
+          );
+          prefixUsed = true;
+          return;
+        }
+        return cond[0]?.map(({ field, operator, value }) => {
+          return {
+            field,
+            operator,
+            value,
+            parentId: p.id,
+          };
+        });
+      })
+      .filter(isDefined);
+
+    const prereqConds =
+      prereqConditionsGrouped.reduce(
+        (acc, val) => val && acc.concat(val),
+        [],
+      ) || [];
+
+    const prereqParts = getConditionParts({
+      conditions: prereqConds,
+      savedGroups,
+      attributeIds,
+      renderPrerequisite: true,
+      initialAnd: prefixUsed,
+      keyPrefix: `${partId++}-prereq-`,
+      prefix: !prefixUsed ? prefix : undefined,
+    });
+    parts.push(...prereqParts);
+    if (prereqParts.length > 0) prefixUsed = true;
+  }
+
+  if (condition && jsonFormattedCondition) {
+    const conds = jsonToConds(condition);
+    // Could not parse into simple conditions
+    if (conds === null || !attributes.size) {
+      parts.push(
+        <div className="w-100" key={partId++}>
+          {!prefixUsed && prefix}
+          <ConditionJson code={jsonFormattedCondition} />
+        </div>,
+      );
+      prefixUsed = true;
+    } else {
+      const conditionParts = getConditionOrParts({
+        conditions: conds,
+        savedGroups,
+        attributeIds,
+        keyPrefix: `${partId++}-condition-`,
+        initialAnd: prefixUsed,
+        prefix: !prefixUsed ? prefix : undefined,
+      });
+      parts.push(...conditionParts);
+      if (conditionParts.length > 0) prefixUsed = true;
+    }
+  }
+
+  return (
+    <Flex
+      direction="column"
+      gap={rows ? "0" : "1"}
+      className={rows ? styles.rows : undefined}
+    >
+      {parts}
+    </Flex>
+  );
+}

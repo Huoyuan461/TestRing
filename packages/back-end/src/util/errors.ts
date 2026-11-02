@@ -1,0 +1,388 @@
+import {
+  ApiErrorCode,
+  ApiErrorDetails,
+  apiErrorRegistry,
+} from "shared/validators";
+import { experimentFieldLabels } from "shared/experiments";
+import { capitalizeFirstCharacter } from "shared/util";
+import type { PublishGate } from "back-end/src/revisions/publishGates";
+
+export abstract class ApiError<C extends ApiErrorCode> extends Error {
+  readonly code: C;
+  readonly status: number;
+  readonly details: ApiErrorDetails<C>;
+
+  constructor(code: C, message: string, details: ApiErrorDetails<C>) {
+    super(message);
+    this.code = code;
+    this.status = apiErrorRegistry[code].status;
+    this.details = details;
+    this.name = "ApiError";
+  }
+}
+
+export class ChecklistIncompleteError extends ApiError<"checklist_incomplete"> {
+  constructor(
+    message: string,
+    remainingChecklistItems: ApiErrorDetails<"checklist_incomplete">["remainingChecklistItems"],
+    readonly gates: PublishGate[],
+  ) {
+    super("checklist_incomplete", message, { remainingChecklistItems });
+    this.name = "ChecklistIncompleteError";
+  }
+}
+
+export class CustomHookError extends ApiError<"custom_hook_error"> {
+  constructor(
+    message: string,
+    hooks: ApiErrorDetails<"custom_hook_error">["hooks"],
+  ) {
+    super("custom_hook_error", message, { hooks });
+    this.name = "CustomHookError";
+  }
+}
+
+// Message is supplied by the caller (typically via formatPendingDraftFailureMessage
+// in services/experiment-feature) to keep this module free of back-end imports
+// — errors.ts is loaded by licenseUtil and other low-level modules.
+export class PendingDraftPublishFailedError extends ApiError<"pending_draft_publish_failed"> {
+  constructor(
+    message: string,
+    failedFeatureDrafts: ApiErrorDetails<"pending_draft_publish_failed">["failedFeatureDrafts"],
+  ) {
+    super("pending_draft_publish_failed", message, { failedFeatureDrafts });
+    this.name = "PendingDraftPublishFailedError";
+  }
+}
+
+export class InvalidStatusError extends ApiError<"invalid_status"> {
+  constructor(
+    message: string,
+    currentStatus: string,
+    expectedStatuses: string[],
+  ) {
+    super("invalid_status", message, {
+      currentStatus,
+      expectedStatuses,
+    });
+    this.name = "InvalidStatusError";
+  }
+}
+
+export class InvalidTrackingKeyError extends ApiError<"invalid_tracking_key"> {
+  constructor(message: string, pattern: string, example: string) {
+    super("invalid_tracking_key", message, { pattern, example });
+    this.name = "InvalidTrackingKeyError";
+  }
+}
+
+// "A", "A and B", "A, B, and C", as Intl.ListFormat joins them.
+const joinList = (names: string[]) =>
+  names.length < 3
+    ? names.join(" and ")
+    : `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+
+export class ChangesConflictError extends ApiError<"changes_conflict"> {
+  constructor(details: ApiErrorDetails<"changes_conflict">) {
+    const names = [
+      ...experimentFieldLabels(details.fields),
+      ...details.featureIds.map((id) => `Feature Flag ${id}`),
+      ...details.urlRedirectIds.map((id) => `URL Redirect ${id}`),
+      ...details.visualChangesetIds.map(
+        (id) => `AI Visual Editor change ${id}`,
+      ),
+    ];
+    super(
+      "changes_conflict",
+      `${capitalizeFirstCharacter(joinList(names))} changed since you loaded ${names.length === 1 ? "it" : "them"}. Reload to see the latest, then make your changes again.`,
+      details,
+    );
+    this.name = "ChangesConflictError";
+  }
+}
+
+export class UnscopedRuleError extends ApiError<"unscoped_rule"> {
+  constructor(count: number, ruleIds: string[]) {
+    super(
+      "unscoped_rule",
+      `${count === 1 ? "This rule applies" : `${count} rules apply`} to All Environments and All Projects. Your organization requires rules to target specific environments or Projects.`,
+      { ruleIds },
+    );
+    this.name = "UnscopedRuleError";
+  }
+}
+
+export class MissingDatasourceParamsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MissingDatasourceParamsError";
+  }
+}
+
+export class DataSourceNotSupportedError extends Error {
+  constructor() {
+    super("This data source is not supported yet.");
+    this.name = "DataSourceNotSupportedError";
+  }
+}
+
+export class SQLExecutionError extends Error {
+  query: string;
+  constructor(message: string, query: string) {
+    super(message);
+    this.name = "SQLExecutionError";
+    this.query = query;
+  }
+}
+
+export class UnrecoverableApiError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnrecoverableApiError";
+  }
+}
+
+export class LicenseServerError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+    this.name = "LicenseServerError";
+  }
+}
+
+export class VercelInstallationNotFound extends Error {}
+
+// Thrown before a held request's first write; runApiHandler turns it into a 202.
+export class ConfirmationRequiredError extends Error {
+  status = 202;
+  constructor(
+    readonly body: Record<string, unknown>,
+    readonly headers: Record<string, string>,
+  ) {
+    super(String(body.message));
+    this.name = "ConfirmationRequiredError";
+  }
+}
+
+export class BadRequestError extends Error {
+  status = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = "BadRequestError";
+  }
+}
+
+export class UnauthorizedError extends Error {
+  status = 401;
+  constructor(message: string) {
+    super(message);
+    this.name = "UnauthorizedError";
+  }
+}
+
+// A plan limit was hit and paying (upgrading) is the way past it.
+export class PaymentRequiredError extends Error {
+  status = 402;
+  constructor(message: string) {
+    super(message);
+    this.name = "PaymentRequiredError";
+  }
+}
+
+export class PlanDoesNotAllowError extends Error {
+  status = 403;
+  constructor(message: string) {
+    super(message);
+    this.name = "PlanDoesNotAllowError";
+  }
+}
+
+export class NotFoundError extends Error {
+  status = 404;
+  constructor(message?: string) {
+    super(message ?? "Not found");
+    this.name = "NotFoundError";
+  }
+}
+
+// Generic 409. Stays as a plain Error so the response body is just `{ message }`
+// — preserving the legacy shape for callers that don't have structured conflict
+// details (e.g. namespace endpoints). Use MergeConflictError for callers that
+// do have a list of conflicts to surface.
+export class ConflictError extends Error {
+  status = 409;
+  constructor(message: string) {
+    super(message);
+    this.name = "ConflictError";
+  }
+}
+
+// The org's soft cap on drafts per feature; `overrideDraftLimit` gets past it.
+export class DraftLimitError extends ConflictError {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftLimitError";
+  }
+}
+
+export class MergeConflictError extends ApiError<"conflict"> {
+  constructor(message: string, conflicts: unknown[]) {
+    super("conflict", message, { conflicts });
+    this.name = "MergeConflictError";
+  }
+}
+
+/**
+ * A bulk publish failed after claims and compensated; `items` carries the
+ * honest per-item outcome, serialized top-level in the 500 body. The endpoint
+ * remaps item identifiers to the caller's vocabulary before rethrowing. Lives
+ * here (the leaf error module) so the response serializer can match on it
+ * without importing the orchestrator's model graph.
+ */
+export class BulkPublishCommitError extends Error {
+  status = 500;
+  items: unknown[];
+  constructor(message: string, items: unknown[]) {
+    super(message);
+    this.name = "BulkPublishCommitError";
+    this.items = items;
+  }
+}
+
+export class BulkImportPartialFailureError extends Error {
+  status: number;
+  counts: Record<string, number>;
+  errors: unknown[];
+  constructor(
+    message: string,
+    counts: Record<string, number>,
+    errors: unknown[],
+    status = 400,
+  ) {
+    super(message);
+    this.name = "BulkImportPartialFailureError";
+    this.status = status;
+    this.counts = counts;
+    this.errors = errors;
+  }
+}
+
+export class SoftWarningError extends Error {
+  status = 422;
+  warnings: string[];
+  constructor(message: string, warnings: string[]) {
+    super(message);
+    this.name = "SoftWarningError";
+    this.warnings = warnings;
+  }
+}
+
+// A publish failure that should not be retried on a later tick: a stale guard
+// fingerprint (the acknowledged conflict set no longer matches), a missing
+// arming user, or a deterministic validation rejection of the staged state
+// (block-mode schema/invariant violations, the descendant schema-safety gate)
+// — retrying produces the identical failure, so the poller gives up on the
+// FIRST occurrence, parks the draft, and fires `revision.publishFailed`.
+// Failures a later tick plausibly resolves on its own (merge claim races,
+// sibling publish locks, an incomplete pre-launch checklist, transient infra)
+// stay ordinary errors and retry to the attempt cap. The
+// `terminalPublishFailure` flag lets the classifier recognize it even across
+// module/re-throw boundaries where `instanceof` can be unreliable. Still a 400
+// for synchronous (manual) callers.
+export class TerminalPublishError extends Error {
+  status = 400;
+  readonly terminalPublishFailure = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "TerminalPublishError";
+  }
+}
+
+export function isTerminalPublishError(error: unknown): boolean {
+  if (error instanceof TerminalPublishError) return true;
+  return (
+    !!error &&
+    typeof error === "object" &&
+    (error as { terminalPublishFailure?: unknown }).terminalPublishFailure ===
+      true
+  );
+}
+
+export class InternalServerError extends Error {
+  status = 500;
+  constructor(message: string) {
+    super(message);
+    this.name = "InternalServerError";
+  }
+}
+
+export class ConcurrentIncrementalRefreshError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConcurrentIncrementalRefreshError";
+  }
+}
+
+// Another advance holds a ramp schedule's advance lock. Transient: callers
+// either retry briefly (user-initiated actions) or defer to the scheduler.
+export class RampAdvanceLockBusyError extends Error {
+  status = 409;
+  constructor(message: string) {
+    super(message);
+    this.name = "RampAdvanceLockBusyError";
+  }
+}
+
+export class ExperimentIncrementalPipelineRequiresFullRefreshError extends ApiError<"requires_full_refresh"> {
+  constructor(reason: string) {
+    super("requires_full_refresh", reason, {
+      reason,
+    });
+    this.name = "ExperimentIncrementalPipelineRequiresFullRefreshError";
+  }
+}
+
+export class DimensionAlreadyUpToDateError extends ApiError<"dimension_already_up_to_date"> {
+  constructor(message: string, overallResultsAsOf: string) {
+    super("dimension_already_up_to_date", message, {
+      overallResultsAsOf,
+    });
+    this.name = "DimensionAlreadyUpToDateError";
+  }
+}
+
+// Snapshot failures that repeat on every retry; auto-updates get disabled, even for bandits
+export class UnrecoverableSnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnrecoverableSnapshotError";
+  }
+}
+
+// Some errors are part of normal operation and shouldn't pollute
+// error-level logs or Sentry. Add cases here as we identify them.
+export function shouldSkipErrorLog(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+
+  // express-jwt wraps the underlying jsonwebtoken error under `inner`.
+  // A TokenExpiredError fires every time a logged-in tab makes a request
+  // after its JWT lifespan; the front-end silently refreshes and retries.
+  const inner = (err as { inner?: { name?: string } }).inner;
+  if (inner?.name === "TokenExpiredError") return true;
+
+  return false;
+}
+
+export function getErrorMessage(error: unknown, fallback?: string): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && "message" in error) {
+    const { message } = error as { message: unknown };
+    if (typeof message === "string") return message;
+    if (message != null) return String(message);
+  }
+  if (error == null) return fallback ?? "Unknown error";
+  return fallback ?? String(error);
+}

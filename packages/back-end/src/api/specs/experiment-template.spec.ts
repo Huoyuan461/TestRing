@@ -1,0 +1,47 @@
+import { z } from "zod";
+import {
+  apiExperimentTemplateValidator,
+  apiListExperimentTemplatesValidator,
+  apiCreateExperimentTemplateBody,
+  apiUpdateExperimentTemplateBody,
+  apiBulkImportExperimentTemplatesBody,
+  apiBulkImportExperimentTemplatesResponse,
+} from "shared/validators";
+import { OpenApiModelSpec } from "shared/api-model";
+
+export const bulkImportExperimentTemplatesEndpoint = {
+  pathFragment: "/bulk-import",
+  verb: "post" as const,
+  confirmation: ["other.write"] as const,
+  operationId: "bulkImportExperimentTemplates",
+  validator: {
+    bodySchema: apiBulkImportExperimentTemplatesBody,
+    querySchema: z.never(),
+    paramsSchema: z.never(),
+  },
+  zodReturnObject: apiBulkImportExperimentTemplatesResponse,
+  summary: "Bulk create or update experiment templates",
+};
+
+export const experimentTemplateApiSpec = {
+  modelSingular: "experimentTemplate",
+  modelPlural: "experimentTemplates",
+  pathBase: "/experiment-templates",
+  apiInterface: apiExperimentTemplateValidator,
+  schemas: {
+    createBody: apiCreateExperimentTemplateBody,
+    updateBody: apiUpdateExperimentTemplateBody,
+  },
+  includeDefaultCrud: true,
+  confirmation: {
+    create: ["other.write"],
+    update: ["other.write"],
+    delete: ["other.write"],
+  },
+  crudValidatorOverrides: {
+    list: apiListExperimentTemplatesValidator,
+  },
+  navAfterTag: "experiments",
+  customEndpoints: [bulkImportExperimentTemplatesEndpoint],
+} satisfies OpenApiModelSpec;
+export default experimentTemplateApiSpec;

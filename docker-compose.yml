@@ -1,0 +1,63 @@
+# 验环（TestRing）私有化部署编排 — MIT
+#
+# 说明：
+# 1. 上游官方 compose 用的是 MongoDB（SSPL 许可）+ growthbook/growthbook 官方镜像
+#    （MIT 与 Enterprise 商业代码混装）。本文件已替换为全开源栈：
+#    PostgreSQL 16 + FerretDB 2（Mongo 协议转译），应用镜像必须从本仓库
+#    剥离后的源码重新构建（见下方 build 说明）。
+# 2. 构建应用镜像前，须先把根目录 Dockerfile 里的 `dhi.io/python` /
+#    `dhi.io/node` 基础镜像换成公开镜像（python:3.11-slim / node:24-slim），
+#    否则构建需要 `docker login dhi.io`（上游私有加固镜像仓库）。
+# 3. 自遥测已默认关闭（DISABLE_TELEMETRY=1），不向 testring.dev 上报。
+
+services:
+  postgres:
+    image: "ghcr.io/ferretdb/postgres-documentdb:17-0.107.0-ferretdb-2.7.0"
+    environment:
+      - POSTGRES_USER=testring
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testring -d testring"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ferretdb:
+    image: "ghcr.io/ferretdb/ferretdb:2"
+    ports:
+      - "27017:27017"
+    environment:
+      - FERRETDB_POSTGRESQL_URL=postgres://testring:password@postgres:5432/postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/ferretdb", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  testring:
+    # 必须从剥离后的本仓库源码构建，禁止使用上游官方镜像
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: "testring/testring:latest"
+    ports:
+      - "3000:3000"
+      - "3100:3100"
+    depends_on:
+      ferretdb:
+        condition: service_healthy
+    environment:
+      - MONGODB_URI=mongodb://testring:password@ferretdb:27017/testring
+      - DISABLE_TELEMETRY=1
+    volumes:
+      - uploads:/usr/local/src/app/packages/back-end/uploads
+
+volumes:
+  uploads:
+  pgdata:

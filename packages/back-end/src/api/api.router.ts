@@ -1,0 +1,300 @@
+import { existsSync, readFileSync } from "fs";
+import path from "path";
+import { Router, Request, RequestHandler } from "express";
+import rateLimit from "express-rate-limit";
+import bodyParser from "body-parser";
+import * as Sentry from "@sentry/node";
+import authenticateApiRequestMiddleware from "back-end/src/middleware/authenticateApiRequestMiddleware";
+import { DashboardModel } from "back-end/src/enterprise/models/DashboardModel";
+import { ContextualBanditModel } from "back-end/src/enterprise/models/ContextualBanditModel";
+import { ContextualBanditQueryModel } from "back-end/src/enterprise/models/ContextualBanditQueryModel";
+import { InterleavingModel } from "back-end/src/enterprise/models/InterleavingModel";
+import { CustomFieldModel } from "back-end/src/models/CustomFieldModel";
+import { MetricGroupModel } from "back-end/src/models/MetricGroupModel";
+import { TeamModel } from "back-end/src/models/TeamModel";
+import { ExperimentTemplatesModel } from "back-end/src/models/ExperimentTemplateModel";
+import { AnalyticsExplorationModel } from "back-end/src/models/AnalyticsExplorationModel";
+import { RampScheduleTemplateModel } from "back-end/src/models/RampScheduleTemplateModel";
+import { RampScheduleModel } from "back-end/src/models/RampScheduleModel";
+import { LearningModel } from "back-end/src/models/LearningModel";
+import { HoldoutModel } from "back-end/src/models/HoldoutModel";
+import { AutoRunModel } from "back-end/src/models/AutoRunModel";
+import { PopulationModel } from "back-end/src/models/PopulationModel";
+import { ModelClass } from "back-end/src/services/context";
+import { getBuild } from "back-end/src/util/build";
+import { ApiRequestLocals } from "back-end/types/api";
+import {
+  API_RATE_LIMIT_MAX,
+  API_RATE_LIMIT_MAX_BY_KEY,
+  API_RATE_LIMIT_SEPARATE_REQUESTERS,
+  API_RATE_LIMIT_SEPARATE_WRITES,
+  IS_CLOUD,
+  SENTRY_DSN,
+} from "back-end/src/util/secrets";
+import {
+  ApiRateLimitSettings,
+  getApiRateLimitBucket,
+} from "back-end/src/util/apiRateLimit";
+import { trackMcpRequestCompletion } from "back-end/src/services/growthbook";
+import { getSavedGroupUploadFile } from "./saved-groups/getSavedGroupUploadFile";
+import { featureRoutes } from "./features/features.router";
+import { featureV2Routes } from "./features/features.v2.router";
+import { experimentsRoutes } from "./experiments/experiments.router";
+import { snapshotsRoutes } from "./snapshots/snapshots.router";
+import { metricsRoutes } from "./metrics/metrics.router";
+import { usageRoutes } from "./usage/usage.router";
+import { segmentsRoutes } from "./segments/segments.router";
+import { projectsRoutes } from "./projects/projects.router";
+import { environmentsRoutes } from "./environments/environments.router";
+import { attributesRoutes } from "./attributes/attributes.router";
+import { savedGroupsRoutes } from "./saved-groups/saved-groups.router";
+import { constantsRoutes } from "./constants/constants.router";
+import { configsRoutes } from "./configs/configs.router";
+import { releasesRoutes } from "./releases/releases.router";
+import { customHooksRoutes } from "./custom-hooks/custom-hooks.router";
+import { sdkConnectionsRoutes } from "./sdk-connections/sdk-connections.router";
+import { sdkPayloadRoutes } from "./sdk-payload/sdk-payload.router";
+import { dataSourcesRoutes } from "./data-sources/data-sources.router";
+import { dimensionsRoutes } from "./dimensions/dimensions.router";
+import { visualChangesetsRoutes } from "./visual-changesets/visual-changesets.router";
+import { organizationsRoutes } from "./organizations/organizations.router";
+import { codeRefsRoutes } from "./code-refs/code-refs.router";
+import { factTablesRoutes } from "./fact-tables/fact-tables.router";
+import { factMetricsRoutes } from "./fact-metrics/fact-metrics.router";
+import { bulkImportRoutes } from "./bulk-import/bulk-import.router";
+import { membersRoutes } from "./members/members.router";
+import { openaiRoutes } from "./openai/openai.router";
+import { archetypesRoutes } from "./archetypes/archetypes.router";
+import { queriesRoutes } from "./queries/queries.router";
+import { settingsRoutes } from "./settings/settings.router";
+import { metaRoutes } from "./meta/meta.router";
+import { confirmationsRoutes } from "./confirmations/confirmations.router";
+import { informationSchemaTablesRoutes } from "./information-schema-tables/information-schema-tables.router";
+import { rampSchedulesRoutes } from "./ramp-schedules/ramp-schedules.router";
+import { reportRoutes } from "./reports/reports.router";
+import { namespacesRoutes } from "./namespaces/namespaces.router";
+import { getOpenApiRoutesForApiConfig } from "./apiModelHandlers";
+
+const API_MODELS: ModelClass[] = [
+  DashboardModel,
+  ContextualBanditModel,
+  ContextualBanditQueryModel,
+  InterleavingModel,
+  CustomFieldModel,
+  MetricGroupModel,
+  TeamModel,
+  ExperimentTemplatesModel,
+  AnalyticsExplorationModel,
+  RampScheduleTemplateModel,
+  RampScheduleModel,
+  LearningModel,
+  HoldoutModel,
+  AutoRunModel,
+  PopulationModel,
+];
+
+const router = Router();
+
+router.use(bodyParser.json({ limit: "2mb" }));
+router.use(bodyParser.urlencoded({ limit: "2mb", extended: true }));
+
+// Public route for OpenAPI spec - must be registered BEFORE authentication middleware
+let openapiSpec: string;
+router.get("/v1/openapi.yaml", (req, res) => {
+  if (!openapiSpec) {
+    const file = path.join(__dirname, "..", "..", "generated", "spec.yaml");
+    if (existsSync(file)) {
+      openapiSpec = readFileSync(file).toString();
+    }
+  }
+  if (!openapiSpec) {
+    return res.status(500).json({
+      message: "Unable to load OpenAPI spec",
+    });
+  }
+
+  res.setHeader("Cache-Control", "max-age=3600");
+  res.setHeader("Content-Type", "text/yaml");
+  res.send(openapiSpec);
+});
+
+router.use(authenticateApiRequestMiddleware as RequestHandler);
+
+// Usage telemetry for calls from the TestRing MCP server. Mounted before the
+// rate limiter so rate-limited calls are counted too.
+router.use(trackMcpRequestCompletion as unknown as RequestHandler);
+
+// Add API user to Sentry if configured
+if (SENTRY_DSN) {
+  router.use(((req: Request & ApiRequestLocals, res, next) => {
+    if (req.user) {
+      Sentry.setUser({
+        id: req.user.id,
+        email: req.user.email,
+        name: req.user.name,
+      });
+    }
+    if (req.context.org) {
+      Sentry.setTag("organization", req.context.org.id);
+    }
+    next();
+  }) as RequestHandler);
+}
+
+const rateLimitSettings: ApiRateLimitSettings = {
+  max: API_RATE_LIMIT_MAX,
+  maxByKey: API_RATE_LIMIT_MAX_BY_KEY,
+  separateWrites: API_RATE_LIMIT_SEPARATE_WRITES,
+  separateRequesters: API_RATE_LIMIT_SEPARATE_REQUESTERS,
+};
+const rateLimitBucket = (req: Request) => {
+  const { apiKey, eventAudit } = req as Request & ApiRequestLocals;
+  return getApiRateLimitBucket(
+    { apiKey, method: req.method, eventAudit },
+    rateLimitSettings,
+  );
+};
+// Rate limit each API key per minute. Skip for JWT requests
+// (interactive UI traffic) — those are already authed as a logged-in user
+// and applying the per-key cap would break dashboards and bulk flows.
+router.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: (req) => rateLimitBucket(req).max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => !!(req as Request & ApiRequestLocals).isJwtAuth,
+    keyGenerator: (req) => rateLimitBucket(req).key,
+    message: (req: Request) => {
+      const { max, writes } = rateLimitBucket(req);
+      // Cloud sets a lower per-server limit, so it states the overall one.
+      const limit = IS_CLOUD ? 60 : max;
+      return {
+        message: `Too many ${writes ? "write requests" : "requests"}, limit to ${limit} per minute`,
+      };
+    },
+  }),
+);
+
+// Index health check route. Registered at both `/` (mounted at `/api/`) and
+// `/v1/` (mounted at `/api/v1/`). Before #5690 the router was mounted at
+// `/api/v1` directly, so `router.get("/")` answered `/api/v1/`. #5690 moved
+// the mount to `/api` with the registration loop below self-prefixing `/v1/`
+// onto other routes, and #5804 hand-updated the openapi route similarly —
+// but this index handler was missed, leaving `/api/v1/` unrouted.
+const indexHandler: RequestHandler = (req, res) => {
+  res.json({
+    name: "TestRing API",
+    apiVersion: 1,
+    build: getBuild(),
+  });
+};
+router.get("/", indexHandler);
+router.get("/v1/", indexHandler);
+
+export const allRoutes = [
+  ...featureRoutes,
+  ...featureV2Routes,
+  ...archetypesRoutes,
+  ...experimentsRoutes,
+  ...snapshotsRoutes,
+  ...metricsRoutes,
+  ...usageRoutes,
+  ...segmentsRoutes,
+  ...dimensionsRoutes,
+  ...projectsRoutes,
+  ...environmentsRoutes,
+  ...attributesRoutes,
+  ...sdkConnectionsRoutes,
+  ...dataSourcesRoutes,
+  ...visualChangesetsRoutes,
+  ...savedGroupsRoutes,
+  ...constantsRoutes,
+  ...configsRoutes,
+  ...releasesRoutes,
+  ...customHooksRoutes,
+  ...organizationsRoutes,
+  ...sdkPayloadRoutes,
+  ...factTablesRoutes,
+  ...factMetricsRoutes,
+  ...bulkImportRoutes,
+  ...codeRefsRoutes,
+  ...membersRoutes,
+  ...queriesRoutes,
+  ...settingsRoutes,
+  ...metaRoutes,
+  ...confirmationsRoutes,
+  ...informationSchemaTablesRoutes,
+  ...rampSchedulesRoutes,
+  ...reportRoutes,
+  ...namespacesRoutes,
+  ...openaiRoutes,
+];
+
+/** Tag metadata from BaseModel specs, keyed by PascalCase tag name */
+export const apiModelTagMeta: Record<
+  string,
+  { displayName?: string; description?: string }
+> = {};
+API_MODELS.forEach((modelClass) => {
+  const apiConfig = modelClass.getModelConfig().apiConfig;
+  if (!apiConfig) return;
+  const routes = getOpenApiRoutesForApiConfig(apiConfig);
+  allRoutes.push(...routes);
+
+  const spec = apiConfig.openApiSpec;
+  const tag =
+    spec.tag ??
+    spec.modelPlural.charAt(0).toUpperCase() + spec.modelPlural.slice(1);
+  apiModelTagMeta[tag] = {
+    displayName: spec.navDisplayName,
+    description: spec.navDescription ?? "",
+  };
+});
+
+// Not JSON, so it can't use createApiRequestHandler. Documented on
+// postSavedGroupUpload.
+router.get(
+  "/v1/saved-groups/:id/uploads/:version/file",
+  getSavedGroupUploadFile,
+);
+
+allRoutes.forEach((route) => {
+  if (!route.method) {
+    return;
+  }
+
+  // Prepend version prefix so v1 routes live at /v1/... and v2 at /v2/...
+  // The router is mounted at /api in app.ts, so the full path becomes
+  // /api/v1/<route> or /api/v2/<route> as appropriate.
+  const version = (route as { version?: string }).version ?? "v1";
+  const versionedPath = `/${version}${route.path}`;
+
+  const middleware: RequestHandler[] = [
+    ...(route.middleware ?? []),
+    // Emit RFC 8594 Deprecation header when the route spec provides a date.
+    ...(route.deprecationDate
+      ? [
+          ((_, res, next) => {
+            res.setHeader("Deprecation", route.deprecationDate as string);
+            next();
+          }) as RequestHandler,
+        ]
+      : []),
+  ];
+
+  if (middleware.length > 0) {
+    router[route.method](versionedPath, middleware, route.handler);
+  } else {
+    router[route.method](versionedPath, route.handler);
+  }
+});
+
+// 404 route
+router.use(function (req, res) {
+  res.status(404).json({
+    message: "Unknown API endpoint",
+  });
+});
+
+export default router;

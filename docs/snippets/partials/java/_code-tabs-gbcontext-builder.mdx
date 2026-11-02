@@ -1,0 +1,54 @@
+<CodeGroup>
+
+```java Java
+// Fetch feature definitions from the TestRing API
+// We recommend adding a caching layer in production
+// Get your endpoint in the Environments tab -> SDK Endpoints: https://app.testring.dev/environments
+URI featuresEndpoint = new URI("https://cdn.testring.dev/api/features/<environment_key>");
+HttpRequest request = HttpRequest.newBuilder().uri(featuresEndpoint).GET().build();
+HttpResponse<String> response = HttpClient.newBuilder().build()
+    .send(request, HttpResponse.BodyHandlers.ofString());
+String featuresJson = new JSONObject(response.body()).get("features").toString();
+
+// JSON serializable user attributes
+String userAttributesJson = user.toJson();
+
+// Initialize the TestRing SDK with the GBContext
+GBContext context = GBContext
+    .builder()
+    .featuresJson(featuresJson)
+    .attributesJson(userAttributesJson)
+    .build();
+
+TestRing growthBook = new TestRing(context);
+```
+
+```kotlin Kotlin
+// Fetch feature definitions from the TestRing API
+// We recommend adding a caching layer in production
+// Get your endpoint in the Environments tab -> SDK Endpoints: https://app.testring.dev/environments
+val featuresEndpoint = URI.create("https://cdn.testring.dev/api/features/<environment_key>")
+val request = HttpRequest.newBuilder().uri(featuresEndpoint).GET().build();
+val response = HttpClient.newBuilder().build()
+    .send(request, HttpResponse.BodyHandlers.ofString());
+val featuresJson = JSONObject(response.body()).get("features").toString()
+
+// JSON serializable user attributes
+val userAttributes = """
+    {
+        "id": "user-abc123",
+        "country": "canada"
+    }
+""".trimIndent()
+
+// Initialize the TestRing SDK with the GBContext
+val context = GBContext
+    .builder()
+    .featuresJson(featuresJson)
+    .attributesJson(userAttributes)
+    .build()
+
+val growthBook = TestRing(context)
+```
+
+</CodeGroup>

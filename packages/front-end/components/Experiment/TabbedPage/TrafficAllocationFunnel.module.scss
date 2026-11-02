@@ -1,0 +1,31 @@
+@import "../../../styles/hover-highlight";
+
+.connectorLine {
+  width: 1px;
+  background-color: var(--slate-a6);
+}
+
+.caret {
+  color: var(--slate-a6);
+}
+
+.cardActions {
+  opacity: 0;
+  transition: opacity 0.1s ease-in-out;
+
+  .card:hover &,
+  &:focus-within,
+  &:has([data-state="open"]) {
+    opacity: 1;
+  }
+}
+
+// The header opens the card's editor wherever it's clicked.
+.editableHeader {
+  @include hover-highlight;
+  @include click-row;
+
+  .edit {
+    @include click-row-target;
+  }
+}

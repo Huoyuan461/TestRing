@@ -1,0 +1,233 @@
+import {
+  slackNotificationPreviewBodySchema,
+  slackLinkBodySchema,
+  slackAccountLinkSchema,
+  slackNotificationSettingsBodySchema,
+  zodNotificationEventNamesEnum,
+} from "shared/validators";
+import express from "express";
+import { z } from "zod";
+import { wrapController } from "back-end/src/routers/wrapController";
+import { validateRequestMiddleware } from "back-end/src/routers/utils/validateRequestMiddleware";
+import * as rawSlackIntegrationController from "./slack-integration.controller";
+
+const router = express.Router();
+
+const slackIntegrationController = wrapController(
+  rawSlackIntegrationController,
+);
+
+router.post(
+  "/preview",
+  validateRequestMiddleware({ body: slackNotificationPreviewBodySchema }),
+  slackIntegrationController.postSlackPreview,
+);
+router.post(
+  "/:id/test",
+  validateRequestMiddleware({
+    params: z.object({ id: z.string().min(1) }).strict(),
+    body: slackNotificationPreviewBodySchema,
+  }),
+  slackIntegrationController.postSlackTest,
+);
+
+router.get("/", slackIntegrationController.getSlackIntegrations);
+
+router.get("/oauth", slackIntegrationController.getSlackOAuthConnections);
+
+router.get(
+  "/oauth/:id",
+  validateRequestMiddleware({
+    params: z.object({ id: z.string() }).strict(),
+  }),
+  slackIntegrationController.getSlackOAuthConnection,
+);
+
+router.put(
+  "/oauth/:id",
+  validateRequestMiddleware({
+    params: z.object({ id: z.string() }).strict(),
+    body: slackNotificationSettingsBodySchema,
+  }),
+  slackIntegrationController.putSlackOAuthConnection,
+);
+
+router.post(
+  "/connect",
+  validateRequestMiddleware({
+    body: z.object({ teamId: z.string().optional() }).strict(),
+  }),
+  slackIntegrationController.postSlackOAuthConnect,
+);
+
+router.post(
+  "/oauth-callback",
+  validateRequestMiddleware({
+    body: z
+      .object({
+        code: z.string().min(1),
+        state: z.string().min(1),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.postSlackOAuthCallback,
+);
+
+// Slack-initiated install (App Directory): code only, no signed state. The org
+// is taken from the confirmed session (X-Organization header).
+router.post(
+  "/oauth-install",
+  validateRequestMiddleware({
+    body: z
+      .object({
+        code: z.string().min(1),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.postSlackOAuthInstall,
+);
+
+router.post(
+  "/link/consent",
+  validateRequestMiddleware({
+    body: z.strictObject({ state: z.string().min(1) }),
+  }),
+  slackIntegrationController.postSlackLinkConsent,
+);
+router.post(
+  "/link",
+  validateRequestMiddleware({ body: slackLinkBodySchema }),
+  slackIntegrationController.postSlackLink,
+);
+router.get("/links", slackIntegrationController.getMySlackLinks);
+router.delete(
+  "/links",
+  validateRequestMiddleware({
+    body: slackAccountLinkSchema.omit({ teamName: true }).strict(),
+  }),
+  slackIntegrationController.deleteMySlackLink,
+);
+
+// Channel management for workspace-level installs. Registered before /:id so
+// "channels" isn't captured as an id param.
+router.get(
+  "/channels",
+  validateRequestMiddleware({
+    query: z
+      .object({
+        teamId: z.string().optional(),
+        cursor: z.string().optional(),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.getSlackWorkspaceChannels,
+);
+
+router.post(
+  "/channels",
+  validateRequestMiddleware({
+    body: z
+      .object({
+        teamId: z.string().optional(),
+        channelId: z.string().min(1),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.postSlackChannel,
+);
+
+// Disconnect an entire workspace (its connection doc + all channel docs).
+router.post(
+  "/disconnect",
+  validateRequestMiddleware({
+    body: z.object({ teamId: z.string().optional() }).strict(),
+  }),
+  slackIntegrationController.postSlackDisconnect,
+);
+
+router.post(
+  "/assistant",
+  validateRequestMiddleware({
+    body: z
+      .object({ teamId: z.string().optional(), enabled: z.boolean() })
+      .strict(),
+  }),
+  slackIntegrationController.postSlackAssistant,
+);
+
+router.get(
+  "/:id",
+  validateRequestMiddleware({
+    params: z
+      .object({
+        id: z.string(),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.getSlackIntegration,
+);
+
+router.post(
+  "/",
+  validateRequestMiddleware({
+    body: z
+      .object({
+        name: z.string(),
+        description: z.string(),
+        projects: z.array(z.string()),
+        environments: z.array(z.string()),
+        events: z.array(z.enum(zodNotificationEventNamesEnum)),
+        tags: z.array(z.string()),
+        slackAppId: z.string(),
+        slackSigningKey: z.string(),
+        slackIncomingWebHook: z
+          .string()
+          .url()
+          .startsWith("https://hooks.slack.com/services/"),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.postSlackIntegration,
+);
+
+router.put(
+  "/:id",
+  validateRequestMiddleware({
+    params: z
+      .object({
+        id: z.string(),
+      })
+      .strict(),
+    body: z
+      .object({
+        name: z.string(),
+        description: z.string(),
+        projects: z.array(z.string()),
+        environments: z.array(z.string()),
+        events: z.array(z.enum(zodNotificationEventNamesEnum)),
+        tags: z.array(z.string()),
+        slackAppId: z.string(),
+        slackSigningKey: z.string(),
+        slackIncomingWebHook: z
+          .string()
+          .url()
+          .startsWith("https://hooks.slack.com/services/"),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.putSlackIntegration,
+);
+
+router.delete(
+  "/:id",
+  validateRequestMiddleware({
+    params: z
+      .object({
+        id: z.string(),
+      })
+      .strict(),
+  }),
+  slackIntegrationController.deleteSlackIntegration,
+);
+
+export { router as slackIntegrationRouter };

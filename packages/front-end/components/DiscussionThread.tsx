@@ -1,0 +1,218 @@
+import { FC, useState } from "react";
+import {
+  DiscussionParentType,
+  DiscussionInterface,
+  Comment,
+} from "shared/types/discussion";
+import { datetime } from "shared/dates";
+import { Box, Flex, Separator } from "@radix-ui/themes";
+import { useAuth } from "@/services/auth";
+import useApi from "@/hooks/useApi";
+import { useUser } from "@/services/UserContext";
+import usePermissionsUtil from "@/hooks/usePermissionsUtils";
+import Callout from "@/ui/Callout";
+import ScrollArea from "@/ui/ScrollArea";
+import Text from "@/ui/Text";
+import Heading from "@/ui/Heading";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  MoreMenuTrigger,
+} from "@/ui/DropdownMenu";
+import LoadingSpinner from "./LoadingSpinner";
+import CommentCard from "./Comments/CommentCard";
+import CommentForm from "./CommentForm";
+import Markdown from "./Markdown/Markdown";
+
+const DiscussionThread: FC<{
+  type: DiscussionParentType;
+  id: string;
+  projects: string[];
+  allowNewComments?: boolean;
+  showTitle?: boolean;
+  title?: string;
+  compact?: boolean;
+  // Fill the given height: the thread scrolls above a pinned composer.
+  fillHeight?: boolean;
+}> = ({
+  type,
+  id,
+  allowNewComments = true,
+  showTitle = false,
+  title = "Add comment",
+  projects,
+  compact = false,
+  fillHeight = false,
+}) => {
+  const { apiCall } = useAuth();
+  const { userId, users } = useUser();
+  const [edit, setEdit] = useState<number | null>(null);
+
+  const permissions = usePermissionsUtil();
+
+  if (!permissions.canAddComment(projects)) {
+    allowNewComments = false;
+  }
+
+  const { data, error, mutate } = useApi<{ discussion: DiscussionInterface }>(
+    `/discussion/${type}/${id}`,
+  );
+
+  if (error) {
+    return <Callout status="error">{error.message}</Callout>;
+  }
+  if (!data) {
+    return <LoadingSpinner />;
+  }
+
+  const comments: Comment[] = data.discussion ? data.discussion.comments : [];
+
+  const thread =
+    comments.length > 0 ? (
+      <Flex direction="column" gap="4">
+        {comments.map((comment, i) => {
+          const user = users.get(comment.userId);
+          const email = user ? user.email : comment.userEmail;
+          const name = user ? user.name : comment.userName;
+          const eventUser = {
+            type: "dashboard" as const,
+            id: comment.userId,
+            email: email ?? "",
+            name: name ?? "",
+          };
+
+          return (
+            <Flex key={i} align="start">
+              <Box flexGrow="1">
+                <CommentCard
+                  compact={compact}
+                  user={eventUser}
+                  metadata={`commented on ${datetime(comment.date)}`}
+                  metadataExtra={
+                    comment.edited && (
+                      <Text color="text-low" size="sm" fontStyle="italic">
+                        &bull; edited
+                      </Text>
+                    )
+                  }
+                  actions={
+                    edit === i
+                      ? null
+                      : comment.userId === userId && (
+                          <DropdownMenu
+                            trigger={
+                              <MoreMenuTrigger
+                                label="Comment actions"
+                                size="sm"
+                                // Undo the ghost variant's negative margin.
+                                style={{ margin: 0 }}
+                              />
+                            }
+                            variant="soft"
+                            menuPlacement="end"
+                          >
+                            <DropdownMenuItem onClick={() => setEdit(i)}>
+                              Edit
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              color="red"
+                              confirmation={{
+                                confirmationTitle: "Delete Comment",
+                                cta: "Delete",
+                                submit: async () => {
+                                  await apiCall(
+                                    `/discussion/${type}/${id}/${i}`,
+                                    { method: "DELETE" },
+                                  );
+                                  mutate();
+                                },
+                              }}
+                            >
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenu>
+                        )
+                  }
+                  body={
+                    edit === i ? (
+                      <CommentForm
+                        cta="Save"
+                        onSave={() => {
+                          mutate();
+                          setEdit(null);
+                        }}
+                        index={i}
+                        id={id}
+                        type={type}
+                        compact={compact}
+                        initialValue={comment.content}
+                        autofocus={true}
+                        onCancel={() => setEdit(null)}
+                      />
+                    ) : (
+                      <Text as="div" size={compact ? "sm" : "md"}>
+                        <Markdown className="speech-bubble">
+                          {comment.content || ""}
+                        </Markdown>
+                      </Text>
+                    )
+                  }
+                />
+              </Box>
+            </Flex>
+          );
+        })}
+      </Flex>
+    ) : (
+      <Text color="text-low" fontStyle="italic" size={compact ? "sm" : "md"}>
+        {allowNewComments
+          ? "No comments yet. Add the first one!"
+          : "No comments."}
+      </Text>
+    );
+
+  return (
+    <Flex
+      direction="column"
+      flexGrow={fillHeight ? "1" : undefined}
+      minHeight={fillHeight ? "0" : undefined}
+    >
+      {fillHeight ? (
+        // The thread scrolls in whatever height the composer leaves.
+        <ScrollArea style={{ flex: 1, minHeight: 0 }}>
+          <Box px="5" pt="4">
+            {thread}
+          </Box>
+        </ScrollArea>
+      ) : (
+        thread
+      )}
+      {allowNewComments && (
+        <Box
+          mt="4"
+          px={fillHeight ? "5" : undefined}
+          pb={fillHeight ? "5" : undefined}
+          flexShrink={fillHeight ? "0" : undefined}
+        >
+          {!showTitle ? (
+            <Separator size="4" mb="4" />
+          ) : (
+            <Heading as="h4" size="sm" mb="3">
+              {title}
+            </Heading>
+          )}
+          <CommentForm
+            cta="Comment"
+            onSave={mutate}
+            index={-1}
+            id={id}
+            type={type}
+            compact={compact}
+          />
+        </Box>
+      )}
+    </Flex>
+  );
+};
+
+export default DiscussionThread;

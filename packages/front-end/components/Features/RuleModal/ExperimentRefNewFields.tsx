@@ -1,0 +1,744 @@
+import { useFormContext } from "react-hook-form";
+import { CustomField } from "shared/types/custom-fields";
+import { MAX_DESCRIPTION_LENGTH } from "shared/constants";
+import {
+  FeatureInterface,
+  FeaturePrerequisite,
+  FeatureRule,
+  SavedGroupTargeting,
+} from "shared/types/feature";
+import React, { useCallback } from "react";
+import Collapsible from "react-collapsible";
+import { Flex } from "@radix-ui/themes";
+import { date } from "shared/dates";
+import {
+  getExposureQueryIdentifierTypes,
+  isProjectListValidForProject,
+  parsePlainJSONObject,
+  stripDefaultsForSparse,
+  expandSparseToFull,
+} from "shared/util";
+import { PiCaretRightFill } from "react-icons/pi";
+import { DataSourceInterfaceWithParams } from "shared/types/datasource";
+import Field from "@/components/Forms/Field";
+import useOrgSettings from "@/hooks/useOrgSettings";
+import useExperimentKeyFieldProps from "@/hooks/useExperimentKeyFieldProps";
+import SelectField from "@/components/Forms/SelectField";
+import FallbackAttributeSelector from "@/components/Features/FallbackAttributeSelector";
+import HashVersionSelector, {
+  allConnectionsSupportBucketingV2,
+} from "@/components/Experiment/HashVersionSelector";
+import {
+  getFeatureDefaultValue,
+  NewExperimentRefRule,
+  useAttributeSchema,
+  resolveAttributeFilter,
+} from "@/services/features";
+import useSDKConnections from "@/hooks/useSDKConnections";
+import TargetingFieldsGroup from "@/components/Features/TargetingFieldsGroup";
+import { type RuleCyclicResult } from "@/components/Features/PrerequisiteInput";
+import NamespaceSelector from "@/components/Features/NamespaceSelector";
+import FeatureVariationsInput from "@/components/Features/FeatureVariationsInput";
+import SparsePatchToggle from "@/components/Features/SparsePatchToggle";
+import ScheduleInputs from "@/components/Features/LegacyScheduleInputs";
+import { SortableVariation } from "@/components/Features/SortableFeatureVariationRow";
+import StickyBucketingToggle from "@/components/Experiment/StickyBucketingToggle";
+import StatsEngineSelect from "@/components/Settings/forms/StatsEngineSelect";
+import ExperimentMetricsSelector from "@/components/Experiment/ExperimentMetricsSelector";
+import { useDefinitions } from "@/services/DefinitionsContext";
+import MetricSelector from "@/components/Experiment/MetricSelector";
+import { MetricsSelectorTooltip } from "@/components/Experiment/MetricsSelector";
+import CustomMetricSlicesSelector from "@/components/Experiment/CustomMetricSlicesSelector";
+import { useTemplates } from "@/hooks/useTemplates";
+import PremiumTooltip from "@/components/Marketing/PremiumTooltip";
+import {
+  AssignmentQueryCopySource,
+  getCopiedAssignmentQueryNotice,
+  getCopySourceIdentifierType,
+  getExposureQueriesForProject,
+} from "@/services/datasources";
+import AssignmentQueryFields, {
+  useAssignmentQuerySelection,
+} from "@/components/Experiment/AssignmentQueryFields";
+import { convertTemplateToExperimentRule } from "@/services/experiments";
+import { useUser } from "@/services/UserContext";
+import Callout from "@/ui/Callout";
+import CustomFieldInput from "@/components/CustomFields/CustomFieldInput";
+import HelperText from "@/ui/HelperText";
+import RuleEnvironmentScopeField, {
+  type EnvScopeProps,
+} from "@/components/Features/RuleModal/EnvironmentScopeField";
+import RuleProjectScopeField, {
+  type ProjectScopeProps,
+} from "@/components/Features/RuleModal/ProjectScopeField";
+import Text from "@/ui/Text";
+import {
+  formatAttributeOptionLabel,
+  toAttributeOption,
+} from "@/components/Features/AttributeOptionTooltip";
+
+export default function ExperimentRefNewFields({
+  step,
+  source,
+  feature,
+  project,
+  attributeProjects,
+  savedGroupProjects,
+  attributeSelectIndicator,
+  environments,
+  defaultValues,
+  prerequisiteValue,
+  setPrerequisiteValue,
+  setPrerequisiteTargetingSdkIssues,
+  isCyclic,
+  cyclicFeatureId,
+  savedGroupValue,
+  setSavedGroupValue,
+  defaultConditionValue,
+  setConditionValue,
+  conditionKey,
+  namespaceFormPrefix = "",
+  noSchedule,
+  scheduleToggleEnabled,
+  setScheduleToggleEnabled,
+  coverage,
+  setCoverage,
+  setWeight,
+  variations,
+  setVariations,
+  variationValuesAsIds = false,
+  hideVariationIds = true,
+  startEditingIndexes = false,
+  orgStickyBucketing,
+  customFields,
+  customFieldValues,
+  setCustomFields,
+  isTemplate = false,
+  holdoutHashAttribute,
+  envScope,
+  projectScope,
+  onRuleCyclicChange,
+  assignmentQueryCopySource,
+  keepAssignmentSelection = false,
+}: {
+  step: number;
+  source: "rule" | "experiment";
+  feature?: FeatureInterface;
+  project?: string;
+  attributeProjects?: string[] | null;
+  savedGroupProjects?: string[] | null;
+  attributeSelectIndicator?: React.ReactNode;
+  environments: string[];
+  defaultValues?: FeatureRule | NewExperimentRefRule;
+  prerequisiteValue: FeaturePrerequisite[];
+  setPrerequisiteValue: (prerequisites: FeaturePrerequisite[]) => void;
+  setPrerequisiteTargetingSdkIssues: (b: boolean) => void;
+  isCyclic?: boolean;
+  cyclicFeatureId?: string | null;
+  savedGroupValue: SavedGroupTargeting[];
+  setSavedGroupValue: (savedGroups: SavedGroupTargeting[]) => void;
+  defaultConditionValue: string;
+  setConditionValue: (s: string) => void;
+  conditionKey: number;
+  namespaceFormPrefix?: string;
+  noSchedule?: boolean;
+  scheduleToggleEnabled?: boolean;
+  setScheduleToggleEnabled?: (b: boolean) => void;
+  coverage: number;
+  setCoverage: (c: number) => void;
+  setWeight?: (i: number, w: number) => void;
+  variations?: SortableVariation[];
+  setVariations?: (v: SortableVariation[]) => void;
+  variationValuesAsIds?: boolean;
+  hideVariationIds?: boolean;
+  startEditingIndexes?: boolean;
+  orgStickyBucketing?: boolean;
+  customFields?: CustomField[];
+  customFieldValues?: Record<string, string>;
+  setCustomFields?: (customFields: Record<string, string>) => void;
+  isTemplate?: boolean;
+  holdoutHashAttribute?: string;
+  envScope?: EnvScopeProps;
+  projectScope?: ProjectScopeProps;
+  onRuleCyclicChange?: (result: RuleCyclicResult) => void;
+  /**
+   * When duplicating or creating from a template: keeps its identifier and
+   * explains a change.
+   */
+  assignmentQueryCopySource?: AssignmentQueryCopySource | null;
+  /**
+   * A saved record being edited: don't rewrite its selection on load, and keep
+   * it listed even if its query no longer declares the identifier.
+   */
+  keepAssignmentSelection?: boolean;
+}) {
+  const form = useFormContext();
+
+  const {
+    segments,
+    getDatasourceById,
+    getExperimentMetricById,
+    getSegmentById,
+    datasources,
+    project: currentProject,
+  } = useDefinitions();
+  const { templates: allTemplates, templatesMap } = useTemplates();
+  const { hasCommercialFeature } = useUser();
+
+  const availableTemplates = allTemplates
+    .slice()
+    .sort((a, b) =>
+      a.templateMetadata.name > b.templateMetadata.name ? 1 : -1,
+    )
+    .filter((t) =>
+      isProjectListValidForProject(
+        t.project ? [t.project] : [],
+        currentProject,
+      ),
+    )
+    .map((t) => ({ value: t.id, label: t.templateMetadata.name }));
+
+  const datasource = form.watch("datasource")
+    ? getDatasourceById(form.watch("datasource") ?? "")
+    : null;
+  const datasourceProperties = datasource?.properties;
+
+  const exposureQueryId = form.watch("exposureQueryId");
+  const exposureQueryIdentifierType = form.watch("exposureQueryIdentifierType");
+
+  const attributeSchema = useAttributeSchema(
+    false,
+    resolveAttributeFilter(attributeProjects, project),
+  );
+  const hasHashAttributes =
+    attributeSchema.filter((x) => x.hashAttribute).length > 0;
+
+  const hashAttribute = form.watch("hashAttribute");
+
+  const { setValue } = form;
+  const setExposureQueryId = useCallback(
+    (value: string) => setValue("exposureQueryId", value),
+    [setValue],
+  );
+  const setExposureQueryIdentifierType = useCallback(
+    (value: string | undefined) =>
+      setValue("exposureQueryIdentifierType", value),
+    [setValue],
+  );
+  const assignmentQuerySelection = useAssignmentQuerySelection({
+    datasource,
+    project,
+    hashAttribute,
+    exposureQueryId,
+    identifierType: exposureQueryIdentifierType,
+    setExposureQueryId,
+    setIdentifierType: setExposureQueryIdentifierType,
+    copiedIdentifierType: getCopySourceIdentifierType(
+      datasource,
+      assignmentQueryCopySource ?? null,
+    ),
+    autoRepair:
+      !keepAssignmentSelection && !!datasourceProperties?.exposureQueries,
+    keepCurrentSelection: keepAssignmentSelection,
+  });
+
+  const getMatchingExposureQuery = (
+    attribute: string,
+    datasource: DataSourceInterfaceWithParams | null,
+  ) => {
+    const identifierType = datasource?.settings?.userIdTypes?.find((t) =>
+      t.attributes?.includes(attribute),
+    )?.userIdType;
+    if (!identifierType) return null;
+    const query = getExposureQueriesForProject(
+      datasource?.settings?.queries?.exposure ?? [],
+      project,
+      datasource?.projects,
+    ).find((q) => getExposureQueryIdentifierTypes(q).includes(identifierType));
+    if (!query) return null;
+    return { exposureQueryId: query.id, identifierType };
+  };
+
+  const { data: sdkConnectionsData } = useSDKConnections();
+  const hasSDKWithNoBucketingV2 = !allConnectionsSupportBucketingV2(
+    sdkConnectionsData?.connections,
+    project,
+  );
+
+  const filteredSegments = segments.filter(
+    (s) => s.datasource === datasource?.id,
+  );
+
+  const settings = useOrgSettings();
+  const trackingKeyFormatProps = useExperimentKeyFieldProps(
+    form.watch("trackingKey"),
+  );
+  const { namespaces, statsEngine: orgStatsEngine } = useOrgSettings();
+
+  const templateRequired =
+    hasCommercialFeature("templates") &&
+    settings.requireExperimentTemplates &&
+    availableTemplates.length >= 1;
+
+  return (
+    <>
+      {step === 0 ? (
+        <>
+          {availableTemplates.length >= 1 && (
+            <div className="form-group">
+              <PremiumTooltip commercialFeature="templates">
+                <label>Select Template</label>
+              </PremiumTooltip>
+              <SelectField
+                size="legacy"
+                value={form.watch("templateId") ?? ""}
+                onChange={(t) => {
+                  if (t === "") {
+                    form.setValue("templateId", undefined);
+                    form.reset();
+                    return;
+                  }
+                  form.setValue("templateId", t);
+                  // Convert template to NewExperimentRefRule interface shape and reset values
+                  const template = templatesMap.get(t);
+                  if (!template) return;
+
+                  const templateAsExperimentRule =
+                    convertTemplateToExperimentRule({
+                      template,
+                      defaultValue: feature
+                        ? getFeatureDefaultValue(feature)
+                        : "",
+                      attributeSchema,
+                    });
+                  form.reset(templateAsExperimentRule, {
+                    keepDefaultValues: true,
+                  });
+                }}
+                name="template"
+                initialOption={"None"}
+                options={availableTemplates}
+                formatOptionLabel={(value) => {
+                  const t = templatesMap.get(value.value);
+                  if (!t) return <span>{value.label}</span>;
+                  return (
+                    <Flex as="div" align="baseline">
+                      <Text>{value.label}</Text>
+                      <Text size="sm" color="text-mid" ml="auto">
+                        Created {date(t.dateCreated)}
+                      </Text>
+                    </Flex>
+                  );
+                }}
+                helpText={
+                  templateRequired
+                    ? "Your organization requires experiments to be created from a template"
+                    : undefined
+                }
+                disabled={!hasCommercialFeature("templates")}
+                required={templateRequired}
+              />
+            </div>
+          )}
+          <Field
+            size="legacy"
+            required={true}
+            minLength={2}
+            label="Experiment Name"
+            {...form.register("name")}
+          />
+
+          <Field
+            size="legacy"
+            label="Tracking Key"
+            {...form.register(`trackingKey`)}
+            placeholder={feature?.id || ""}
+            {...trackingKeyFormatProps}
+            helpText="Unique identifier for this Experiment, used to track impressions and analyze results"
+          />
+
+          <Field
+            size="legacy"
+            label="Hypothesis"
+            textarea
+            minRows={1}
+            {...form.register("hypothesis")}
+            placeholder="e.g. Making the signup button bigger will increase clicks and ultimately improve revenue"
+          />
+
+          <Field
+            size="legacy"
+            label="Description"
+            textarea
+            minRows={1}
+            maxLength={MAX_DESCRIPTION_LENGTH}
+            {...form.register("description")}
+            placeholder="Short human-readable description of the Experiment"
+          />
+
+          {envScope && <RuleEnvironmentScopeField {...envScope} my="5" />}
+          {projectScope && <RuleProjectScopeField {...projectScope} mb="5" />}
+
+          {!!customFields?.length && (
+            <CustomFieldInput
+              fields={customFields}
+              value={customFieldValues ?? {}}
+              onChange={setCustomFields ? setCustomFields : () => {}}
+            />
+          )}
+        </>
+      ) : null}
+
+      {step === 1 ? (
+        <>
+          <div className="mb-4">
+            <Text as="label" weight="semibold" mb="1">
+              Assign Variation by Attribute
+            </Text>
+            <Text as="div" color="text-mid" mb="2">
+              Will be hashed together with the Tracking Key to determine which
+              variation to assign
+            </Text>
+            <SelectField
+              size="legacy"
+              withRadixThemedPortal
+              containerClassName="flex-1"
+              extraIndicator={attributeSelectIndicator}
+              options={attributeSchema
+                .filter((s) => !hasHashAttributes || s.hashAttribute)
+                .map(toAttributeOption)}
+              value={hashAttribute}
+              onChange={(v) => form.setValue("hashAttribute", v)}
+              formatOptionLabel={formatAttributeOptionLabel}
+            />
+            {!!holdoutHashAttribute &&
+              form.watch("hashAttribute") !== holdoutHashAttribute && (
+                <HelperText status="warning" size="sm" mb="4">
+                  The hash attribute of this experiment does not match the hash
+                  attribute of the holdout this experiment will belong to.
+                </HelperText>
+              )}
+            {hasSDKWithNoBucketingV2 && !isTemplate && (
+              <HashVersionSelector
+                value={(form.watch("hashVersion") || 1) as 1 | 2}
+                onChange={(v) => form.setValue("hashVersion", v)}
+                project={project}
+              />
+            )}
+
+            {orgStickyBucketing && !isTemplate ? (
+              <StickyBucketingToggle
+                mt="4"
+                disableStickyBucketing={!!form.watch("disableStickyBucketing")}
+                setDisableStickyBucketing={(v) =>
+                  form.setValue("disableStickyBucketing", v)
+                }
+                description="Keep users in their assigned variation even when experiment traffic, targeting, or rollout settings change."
+              />
+            ) : null}
+
+            {!form.watch("disableStickyBucketing") && (
+              <FallbackAttributeSelector
+                form={form}
+                attributeSchema={attributeSchema}
+                extraIndicator={attributeSelectIndicator}
+              />
+            )}
+          </div>
+
+          {feature &&
+            feature.valueType === "json" &&
+            parsePlainJSONObject(getFeatureDefaultValue(feature)) !== null && (
+              <Flex align="center" gap="3" mb="2">
+                <SparsePatchToggle
+                  checked={!!form.watch("sparse")}
+                  onChange={(checked) => {
+                    // Rewrite every variation value so the editor isn't left
+                    // with a default-laden patch (on) or a bare patch shown as
+                    // the full value (off).
+                    const def = feature ? getFeatureDefaultValue(feature) : "";
+                    setVariations?.(
+                      (variations || []).map((variation) => ({
+                        ...variation,
+                        value: checked
+                          ? stripDefaultsForSparse(variation.value, def)
+                          : expandSparseToFull(variation.value, def),
+                      })),
+                    );
+                    form.setValue("sparse", checked);
+                  }}
+                />
+              </Flex>
+            )}
+          <FeatureVariationsInput
+            label="Traffic Percent & Variations"
+            defaultValue={feature ? getFeatureDefaultValue(feature) : undefined}
+            valueType={feature?.valueType}
+            coverageLabel="Traffic included in this Experiment"
+            coverageTooltip={`Users not included in the Experiment will skip this ${source}`}
+            coverage={coverage}
+            setCoverage={setCoverage}
+            setWeight={setWeight}
+            variations={variations}
+            setVariations={setVariations}
+            feature={feature}
+            valueAsId={variationValuesAsIds}
+            hideVariationIds={hideVariationIds}
+            hideVariations={isTemplate}
+            disableVariations={isTemplate}
+            startEditingIndexes={startEditingIndexes}
+            sparse={!!form.watch("sparse")}
+          />
+
+          {!isTemplate && namespaces && namespaces.length > 0 && (
+            <NamespaceSelector
+              form={form}
+              formPrefix={namespaceFormPrefix}
+              trackingKey={form.watch("trackingKey") || feature?.id}
+              featureId={feature?.id || ""}
+              experimentHashAttribute={hashAttribute}
+              fallbackAttribute={form.watch("fallbackAttribute")}
+            />
+          )}
+        </>
+      ) : null}
+
+      {step === 2 ? (
+        <>
+          <TargetingFieldsGroup
+            project={project || ""}
+            attributeProjects={attributeProjects}
+            savedGroupProjects={savedGroupProjects}
+            attributeSelectIndicator={attributeSelectIndicator}
+            environments={environments ?? []}
+            feature={feature}
+            savedGroups={savedGroupValue}
+            setSavedGroups={setSavedGroupValue}
+            condition={defaultConditionValue}
+            setCondition={setConditionValue}
+            conditionKey={conditionKey}
+            prerequisites={prerequisiteValue}
+            setPrerequisites={setPrerequisiteValue}
+            setPrerequisiteTargetingSdkIssues={
+              setPrerequisiteTargetingSdkIssues
+            }
+            onRuleCyclicChange={onRuleCyclicChange}
+          />
+          {isCyclic && (
+            <Callout status="error">
+              A prerequisite (<code>{cyclicFeatureId}</code>) creates a circular
+              dependency. Remove this prerequisite to continue.
+            </Callout>
+          )}
+
+          {!isTemplate &&
+          source === "rule" &&
+          !noSchedule &&
+          setScheduleToggleEnabled ? (
+            <div className="mt-4 mb-3">
+              <hr className="mb-4" />
+              <ScheduleInputs
+                defaultValue={defaultValues?.scheduleRules || []}
+                onChange={(value) => form.setValue("scheduleRules", value)}
+                scheduleToggleEnabled={!!scheduleToggleEnabled}
+                setScheduleToggleEnabled={setScheduleToggleEnabled}
+              />
+            </div>
+          ) : null}
+        </>
+      ) : null}
+      {step === 3 ? (
+        <>
+          <div className="rounded px-3 pt-3 pb-1 bg-highlight mb-4">
+            <SelectField
+              size="legacy"
+              label="Data Source"
+              labelClassName="font-weight-bold"
+              value={form.watch("datasource") ?? ""}
+              onChange={(newDatasource) => {
+                form.setValue("datasource", newDatasource);
+
+                // If unsetting the datasource, leave all the other settings alone
+                // That way, it will be restored if the user switches back to the previous value
+                if (!newDatasource) return;
+
+                const isValidMetric = (id: string) =>
+                  getExperimentMetricById(id)?.datasource === newDatasource;
+
+                // If the segment is now invalid
+                const segment = form.watch("segment");
+                if (
+                  segment &&
+                  getSegmentById(segment)?.datasource !== newDatasource
+                ) {
+                  form.setValue("segment", "");
+                }
+
+                // If the activationMetric is now invalid
+                const activationMetric = form.watch("activationMetric");
+                if (activationMetric && !isValidMetric(activationMetric)) {
+                  form.setValue("activationMetric", "");
+                }
+
+                // Try and find a matching exposure query for the new datasource
+                const match = getMatchingExposureQuery(
+                  hashAttribute,
+                  getDatasourceById(newDatasource),
+                );
+                if (match) {
+                  form.setValue("exposureQueryId", match.exposureQueryId);
+                  form.setValue(
+                    "exposureQueryIdentifierType",
+                    match.identifierType,
+                  );
+                }
+              }}
+              options={datasources.map((d) => {
+                const isDefaultDataSource = d.id === settings.defaultDataSource;
+                return {
+                  value: d.id,
+                  label: `${d.name}${
+                    d.description ? ` — ${d.description}` : ""
+                  }${isDefaultDataSource ? " (default)" : ""}`,
+                };
+              })}
+              className="portal-overflow-ellipsis"
+            />
+
+            {datasourceProperties?.exposureQueries ? (
+              <AssignmentQueryFields
+                selection={assignmentQuerySelection}
+                notice={getCopiedAssignmentQueryNotice(
+                  datasource,
+                  assignmentQueryCopySource ?? null,
+                  {
+                    exposureQueryId,
+                    identifierType: exposureQueryIdentifierType,
+                  },
+                )}
+              />
+            ) : null}
+          </div>
+
+          <ExperimentMetricsSelector
+            datasource={datasource?.id}
+            exposureQueryId={exposureQueryId}
+            exposureQueryIdentifierType={exposureQueryIdentifierType}
+            project={project}
+            goalMetrics={form.watch("goalMetrics") ?? []}
+            secondaryMetrics={form.watch("secondaryMetrics") ?? []}
+            guardrailMetrics={form.watch("guardrailMetrics") ?? []}
+            setGoalMetrics={(goalMetrics) =>
+              form.setValue("goalMetrics", goalMetrics)
+            }
+            setSecondaryMetrics={(secondaryMetrics) =>
+              form.setValue("secondaryMetrics", secondaryMetrics)
+            }
+            setGuardrailMetrics={(guardrailMetrics) =>
+              form.setValue("guardrailMetrics", guardrailMetrics)
+            }
+            collapseSecondary={true}
+            collapseGuardrail={true}
+            experimentType="standard"
+          />
+
+          <CustomMetricSlicesSelector
+            goalMetrics={form.watch("goalMetrics") ?? []}
+            secondaryMetrics={form.watch("secondaryMetrics") ?? []}
+            guardrailMetrics={form.watch("guardrailMetrics") ?? []}
+            customMetricSlices={form.watch("customMetricSlices") ?? []}
+            setCustomMetricSlices={(slices) =>
+              form.setValue("customMetricSlices", slices)
+            }
+          />
+
+          <hr className="mt-4" />
+
+          <Collapsible
+            trigger={
+              <div className="link-purple font-weight-bold mt-4 mb-2">
+                <PiCaretRightFill className="chevron mr-1" />
+                Advanced Settings
+              </div>
+            }
+            transitionTime={100}
+          >
+            <div className="rounded px-3 pt-3 pb-1 bg-highlight">
+              {!!datasource && (
+                <MetricSelector
+                  datasource={form.watch("datasource")}
+                  exposureQueryId={exposureQueryId}
+                  project={project}
+                  includeFacts={true}
+                  labelClassName="font-weight-bold"
+                  label={
+                    <>
+                      Activation Metric{" "}
+                      <MetricsSelectorTooltip
+                        onlyBinomial={true}
+                        noFactFunnelMetrics={true}
+                        isSingular={true}
+                      />
+                    </>
+                  }
+                  initialOption="None"
+                  onlyBinomial
+                  filterFactFunnelMetrics
+                  value={form.watch("activationMetric")}
+                  onChange={(value) =>
+                    form.setValue("activationMetric", value || "")
+                  }
+                  helpText="Users must convert on this metric before being included"
+                />
+              )}
+              {datasourceProperties?.experimentSegments && (
+                <SelectField
+                  size="legacy"
+                  label="Segment"
+                  labelClassName="font-weight-bold"
+                  value={form.watch("segment")}
+                  onChange={(value) => form.setValue("segment", value || "")}
+                  initialOption="None (All Users)"
+                  options={filteredSegments.map((s) => {
+                    return {
+                      label: s.name,
+                      value: s.id,
+                    };
+                  })}
+                  helpText="Only users in this segment will be included"
+                />
+              )}
+              {datasourceProperties?.separateExperimentResultQueries && (
+                <SelectField
+                  size="legacy"
+                  label="Metric Conversion Windows"
+                  labelClassName="font-weight-bold"
+                  value={form.watch("skipPartialData")}
+                  onChange={(value) => form.setValue("skipPartialData", value)}
+                  options={[
+                    {
+                      label: "Include In-Progress Conversions",
+                      value: "loose",
+                    },
+                    {
+                      label: "Exclude In-Progress Conversions",
+                      value: "strict",
+                    },
+                  ]}
+                  helpText="For users not enrolled in the experiment long enough to complete conversion window"
+                />
+              )}
+              <StatsEngineSelect
+                className="mb-4"
+                label={<div>Statistics Engine</div>}
+                value={form.watch("statsEngine") ?? orgStatsEngine}
+                onChange={(v) => form.setValue("statsEngine", v)}
+                allowUndefined={false}
+              />
+            </div>
+          </Collapsible>
+        </>
+      ) : null}
+    </>
+  );
+}

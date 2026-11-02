@@ -1,0 +1,385 @@
+import { isSavedGroupAvailableForProjects } from "shared/util";
+import { SavedGroupTargeting } from "shared/types/feature";
+import { PiPlusCircleBold, PiXBold } from "react-icons/pi";
+import React, { useEffect } from "react";
+import { Box, Flex, IconButton, Separator } from "@radix-ui/themes";
+import Text from "@/ui/Text";
+import Tooltip from "@/ui/Tooltip";
+import Badge from "@/ui/Badge";
+import { useDefinitions } from "@/services/DefinitionsContext";
+import SelectField from "@/components/Forms/SelectField";
+import MultiSelectField from "@/ui/MultiSelectField";
+import LargeSavedGroupPerformanceWarning, {
+  useLargeSavedGroupSupport,
+} from "@/components/SavedGroups/LargeSavedGroupSupportWarning";
+import Link from "@/ui/Link";
+import { formatSavedGroupOptionLabel } from "@/components/Features/SavedGroupOptionTooltip";
+import RadioGroup from "@/ui/RadioGroup";
+import RemoteGroupNotLoadedWarning from "@/components/SavedGroups/RemoteGroupNotLoadedWarning";
+import Callout from "@/ui/Callout";
+import {
+  TargetingConditionsCard,
+  ConditionRow,
+  AddConditionButton,
+  ConditionRowLabel,
+} from "./TargetingConditionsCard";
+
+export interface Props {
+  value: SavedGroupTargeting[];
+  setValue: (savedGroups: SavedGroupTargeting[]) => void;
+  project: string;
+  // undefined preserves the default picker convenience; null targets all Projects.
+  savedGroupProjects?: string[] | null;
+  slimMode?: boolean;
+  emptyText?: string;
+  label?: string;
+  labelActions?: React.ReactNode;
+  locked?: boolean;
+  addRemoveMode?: boolean;
+  addRemoveValue?: "set" | "remove";
+  onAddRemoveValueChange?: (value: "set" | "remove") => void;
+  onRemoveEffect?: () => void;
+  setModeLabel?: string;
+  removeModeLabel?: string;
+}
+
+export default function SavedGroupTargetingField({
+  value,
+  setValue,
+  project,
+  savedGroupProjects,
+  slimMode,
+  emptyText,
+  label = "Target by Saved Groups",
+  labelActions,
+  locked,
+  addRemoveMode,
+  addRemoveValue,
+  onAddRemoveValueChange,
+  onRemoveEffect,
+  setModeLabel,
+  removeModeLabel,
+}: Props) {
+  const { savedGroups, getSavedGroupById } = useDefinitions();
+
+  const largeSavedGroupSupport = useLargeSavedGroupSupport(project);
+
+  // The picker below lists both kinds of Saved Group, so warn about whichever
+  // this rule actually targets. A Condition Group needs a newer SDK than an
+  // ID List does.
+  const targetsConditionGroup = value.some((v) =>
+    v.ids.some((id) => getSavedGroupById(id)?.type === "condition"),
+  );
+
+  const savedGroupsLabel =
+    label &&
+    (slimMode ? (
+      <Text as="div" size="md" weight="semibold" color="text-mid">
+        {label}
+      </Text>
+    ) : (
+      <Text as="div" size="md" weight="semibold">
+        {label}
+      </Text>
+    ));
+  const showAddRemoveSelector =
+    !!addRemoveMode && !!addRemoveValue && !!onAddRemoveValueChange;
+  const addRemoveSelector = showAddRemoveSelector ? (
+    <RadioGroup
+      mt="2"
+      gap="0"
+      value={addRemoveValue}
+      setValue={(v) => onAddRemoveValueChange(v as "set" | "remove")}
+      options={[
+        { value: "set", label: setModeLabel ?? "Set targeting" },
+        { value: "remove", label: removeModeLabel ?? "Remove targeting" },
+      ]}
+      labelSize="md"
+    />
+  ) : null;
+  useEffect(() => {
+    if (!showAddRemoveSelector || addRemoveValue !== "set") return;
+    if (value.length > 0) return;
+    setValue([{ match: "any", ids: [] }]);
+  }, [showAddRemoveSelector, addRemoveValue, value, setValue]);
+
+  if (!savedGroups.length)
+    return (
+      <Box>
+        {savedGroupsLabel}
+        <Box>
+          <Text color="text-low" fontStyle="italic" mb="2">
+            You do not have any saved groups.
+          </Text>
+        </Box>
+        {addRemoveSelector}
+      </Box>
+    );
+
+  const filteredSavedGroups = savedGroups.filter((group) => {
+    // Keep already selected references visible for grandfathered rules.
+    if (value.some((targeting) => targeting.ids.includes(group.id)))
+      return true;
+    return savedGroupProjects === undefined
+      ? !project || !group.projects?.length || group.projects.includes(project)
+      : isSavedGroupAvailableForProjects(group, savedGroupProjects);
+  });
+
+  const options = filteredSavedGroups.map((s) => ({
+    value: s.id,
+    label: s.groupName,
+  }));
+
+  const conflicts = getSavedGroupTargetingConflicts(value);
+
+  if (showAddRemoveSelector && addRemoveValue === "remove") {
+    return (
+      <Box mb="0">
+        {label || labelActions ? (
+          <Flex mb="1" justify="between" align="center">
+            {savedGroupsLabel}
+            {labelActions}
+          </Flex>
+        ) : (
+          savedGroupsLabel
+        )}
+        {addRemoveSelector}
+      </Box>
+    );
+  }
+
+  if (value.length === 0) {
+    return (
+      <Box>
+        {(label || labelActions) && (
+          <Flex mb="1" justify="between" align="center">
+            {savedGroupsLabel}
+            {labelActions}
+          </Flex>
+        )}
+        {!label && !labelActions && savedGroupsLabel}
+        {addRemoveSelector}
+        <Box>
+          {(emptyText || !slimMode) && (
+            <Text
+              color="text-low"
+              fontStyle="italic"
+              mb="2"
+              size={slimMode ? "sm" : undefined}
+            >
+              {emptyText || "No saved group targeting applied."}
+            </Text>
+          )}
+          {!showAddRemoveSelector && (
+            <Box mt={slimMode ? "0" : "2"}>
+              <Link
+                onClick={() => {
+                  if (locked) return;
+                  setValue([
+                    ...value,
+                    {
+                      match: "any",
+                      ids: [],
+                    },
+                  ]);
+                }}
+              >
+                <Text
+                  weight="semibold"
+                  size="md"
+                  color={locked ? "text-low" : undefined}
+                >
+                  <PiPlusCircleBold className="mr-1" />
+                  Add group targeting
+                </Text>
+              </Link>
+            </Box>
+          )}
+        </Box>
+      </Box>
+    );
+  }
+
+  return (
+    <Box mb="0">
+      {label || labelActions ? (
+        <Flex mb="1" justify="between" align="center">
+          {savedGroupsLabel}
+          {labelActions}
+        </Flex>
+      ) : (
+        savedGroupsLabel && <Box mb="1">{savedGroupsLabel}</Box>
+      )}
+      {/* Outside the branch above: `label` has a default, so every call site
+          takes the first one. The warning renders itself away when there is
+          nothing to say. */}
+      <LargeSavedGroupPerformanceWarning
+        {...largeSavedGroupSupport}
+        type={targetsConditionGroup ? "condition" : "list"}
+      />
+      {addRemoveSelector}
+      <Box>
+        {conflicts.length > 0 && (
+          <Callout status="error" mb="3">
+            <Text weight="semibold">Error:</Text> You have a conflict in your
+            rules with the following groups:{" "}
+            {conflicts.map((c) => (
+              <Badge
+                key={c}
+                label={getSavedGroupById(c)?.groupName || c}
+                color="red"
+                mr="1"
+              />
+            ))}
+          </Callout>
+        )}
+        <TargetingConditionsCard
+          targetingType="group"
+          total={value.length}
+          slimMode={slimMode}
+          addButton={
+            <AddConditionButton
+              disabled={locked}
+              onClick={() => {
+                setValue([
+                  ...value,
+                  {
+                    match: "any",
+                    ids: [],
+                  },
+                ]);
+              }}
+            >
+              Add condition
+            </AddConditionButton>
+          }
+        >
+          <>
+            {value.map((v, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && (
+                  <Separator
+                    style={{
+                      width: "100%",
+                      backgroundColor: "var(--slate-a3)",
+                    }}
+                  />
+                )}
+                <ConditionRow
+                  prefixSlot={
+                    slimMode ? undefined : (
+                      <ConditionRowLabel label={i === 0 ? "IF IN" : "AND"} />
+                    )
+                  }
+                  attributeSlot={
+                    <SelectField
+                      size="legacy"
+                      disabled={locked}
+                      value={v.match}
+                      onChange={(match) => {
+                        const newValue = [...value];
+                        newValue[i] = { ...v };
+                        newValue[i].match = match as "all" | "any" | "none";
+                        setValue(newValue);
+                      }}
+                      sort={false}
+                      options={[
+                        { value: "any", label: "any of" },
+                        { value: "all", label: "all of" },
+                        { value: "none", label: "none of" },
+                      ]}
+                    />
+                  }
+                  valueSlot={
+                    <Box style={{ flexBasis: "100%", minWidth: 0 }}>
+                      <MultiSelectField
+                        legacyHeight
+                        disabled={locked}
+                        value={v.ids}
+                        onChange={(ids) => {
+                          const newValue = [...value];
+                          newValue[i] = { ...v };
+                          newValue[i].ids = ids;
+                          setValue(newValue);
+                        }}
+                        options={options}
+                        formatOptionLabel={formatSavedGroupOptionLabel}
+                        valueTitles={false}
+                        required
+                        placeholder="Select groups..."
+                        closeMenuOnSelect={true}
+                      />
+                      {v.match === "none" &&
+                        v.ids.map((id) => (
+                          <RemoteGroupNotLoadedWarning key={id} groupId={id} />
+                        ))}
+                    </Box>
+                  }
+                  removeSlot={
+                    <Tooltip content="Remove group">
+                      <IconButton
+                        type="button"
+                        color="gray"
+                        variant="ghost"
+                        radius="full"
+                        size="1"
+                        disabled={locked}
+                        onClick={() => {
+                          if (showAddRemoveSelector && value.length === 1) {
+                            if (onRemoveEffect) {
+                              onRemoveEffect();
+                            } else {
+                              onAddRemoveValueChange?.("remove");
+                            }
+                            return;
+                          }
+                          const newValue = value.filter((_, idx) => idx !== i);
+                          setValue(newValue);
+                        }}
+                      >
+                        <PiXBold size={16} />
+                      </IconButton>
+                    </Tooltip>
+                  }
+                />
+              </React.Fragment>
+            ))}
+          </>
+        </TargetingConditionsCard>
+      </Box>
+    </Box>
+  );
+}
+
+export function getSavedGroupTargetingConflicts(
+  savedGroups: SavedGroupTargeting[],
+): string[] {
+  const required = new Set<string>();
+  const excluded = new Set<string>();
+  savedGroups.forEach((rule) => {
+    if (rule.match === "all" || rule.match === "any") {
+      rule.ids.forEach((id) => required.add(id));
+    } else if (rule.match === "none") {
+      rule.ids.forEach((id) => excluded.add(id));
+    }
+  });
+
+  // If there's an overlap between required and excluded groups, there's a conflict
+  return Array.from(required).filter((id) => excluded.has(id));
+}
+
+export function validateSavedGroupTargeting(
+  savedGroups?: SavedGroupTargeting[],
+) {
+  if (!savedGroups) return;
+
+  if (savedGroups.some((g) => g.ids.length === 0)) {
+    throw new Error("Cannot have empty Saved Group targeting rules.");
+  }
+
+  if (getSavedGroupTargetingConflicts(savedGroups).length > 0) {
+    throw new Error(
+      "Please fix conflicts in your Saved Group rules before saving",
+    );
+  }
+}

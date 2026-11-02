@@ -1,0 +1,308 @@
+import omit from "lodash/omit";
+import type { OrganizationInterface } from "shared/types/organization";
+import {
+  FeatureRule,
+  RevisionRampUpdateAction,
+  RampStartState,
+  putFeatureRevisionRuleRampScheduleValidator,
+  RampScheduleInterface,
+} from "shared/validators";
+import { getApplicableEnvIds } from "shared/util";
+import {
+  normalizeRampActionsForceValues,
+  resolveRampStartState,
+} from "back-end/src/services/rampSchedule";
+import type { ApiReqContext } from "back-end/types/api";
+import { toApiRevision } from "back-end/src/services/features";
+import { recordRevisionUpdate } from "back-end/src/services/featureRevisionEvents";
+import { BadRequestError, NotFoundError } from "back-end/src/util/errors";
+import { createApiRequestHandler } from "back-end/src/util/handler";
+import { getFeature } from "back-end/src/models/FeatureModel";
+import {
+  getRevision,
+  updateRevision,
+} from "back-end/src/models/FeatureRevisionModel";
+import {
+  resolveRampTarget,
+  ruleFootprint,
+} from "back-end/src/util/flattenRules";
+import { getEnvironments } from "back-end/src/util/organization.util";
+import {
+  assertValidEnvironment,
+  collectRampPlanPatches,
+  mergedRampPlan,
+  withTemplatePlan,
+  discardIfJustCreated,
+  isDraftStatus,
+  normalizeInlineRampSchedule,
+  rampPatchEntries,
+  resolveOrCreateRevision,
+  validateRampPlanPatches,
+} from "./validations";
+
+export async function setRuleRampSchedule(
+  context: ApiReqContext,
+  organization: OrganizationInterface,
+  params: { id: string; version: number | "new"; ruleId: string },
+  body: {
+    environment?: string;
+    revisionTitle?: string;
+    revisionComment?: string;
+    // All remaining fields are forwarded as the inline schedule definition.
+    [k: string]: unknown;
+  },
+) {
+  const feature = await getFeature(context, params.id);
+  if (!feature) throw new NotFoundError("Could not find feature");
+
+  if (!context.permissions.canEditFeatureDrafts(feature)) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { ruleId } = params;
+  const { environment, revisionTitle, revisionComment, ...scheduleInput } =
+    body;
+  if (environment) assertValidEnvironment(context, environment);
+
+  // Runs before the draft is created for `version: "new"` so a refusal can't
+  // orphan one; for an existing draft, below, once its rule and pending action
+  // are known.
+  // `live` is the schedule this plan updates: what the body omits stays as
+  // stored, and a new anchor only counts while the stored one can still change.
+  const checkPatches = async (
+    rule: FeatureRule | undefined,
+    live: RampScheduleInterface | undefined,
+    stored: unknown[],
+  ) => {
+    const anchorFrozen =
+      live && live.status !== "pending" && live.status !== "ready";
+    const plan = anchorFrozen
+      ? omit(scheduleInput, ["startState", "startActions"])
+      : scheduleInput;
+    await validateRampPlanPatches(
+      context,
+      rampPatchEntries(
+        collectRampPlanPatches(
+          mergedRampPlan((await withTemplatePlan(context, plan)) ?? plan, live),
+        ),
+        feature,
+        rule,
+      ),
+      { stored },
+    );
+  };
+  if (params.version === "new") {
+    const liveRule = resolveRampTarget(
+      { ruleId, environment: environment ?? null },
+      feature.rules ?? [],
+    );
+    const liveSchedules = liveRule
+      ? await context.models.rampSchedules.findByTargetRule(
+          liveRule.id,
+          environment ?? undefined,
+        )
+      : [];
+    await checkPatches(liveRule, liveSchedules[0], liveSchedules);
+  }
+
+  const { revision, created } = await resolveOrCreateRevision(
+    context,
+    organization.id,
+    feature,
+    params.version,
+    { title: revisionTitle, comment: revisionComment },
+  );
+
+  try {
+    if (!isDraftStatus(revision.status)) {
+      throw new BadRequestError(
+        `Cannot edit a revision with status "${revision.status}"`,
+      );
+    }
+
+    const envSuffix = environment ? ` in environment "${environment}"` : "";
+
+    // Check draft first, then live — a ramp schedule may target a live rule
+    // the draft hasn't touched. resolveRampTarget matches the v2 unified
+    // rules array via stem+env quadrants (see its JSDoc).
+    const draftMatch = resolveRampTarget(
+      { ruleId, environment: environment ?? null },
+      revision.rules ?? [],
+    );
+    const liveMatch = resolveRampTarget(
+      { ruleId, environment: environment ?? null },
+      feature.rules ?? [],
+    );
+    const match = draftMatch ?? liveMatch;
+    if (!match) {
+      throw new NotFoundError(`Rule "${ruleId}" not found${envSuffix}`);
+    }
+
+    // Canonical id the revision stores this rule under. All persisted
+    // references (rampActions.ruleId, audit subject, event payload) must use
+    // `match.id`, not the caller's URL param — otherwise round-trip cleanup
+    // (DELETE by the GET-returned id) breaks for stem↔suffix ambiguity.
+    const canonicalRuleId = match.id;
+
+    // If an active live schedule controls this rule, queue a deferred
+    // revision-time `update` action instead of requiring an instant write via
+    // PUT /ramp-schedule/:id. This keeps config edits revision-controlled.
+    const liveSchedules = await context.models.rampSchedules.findByTargetRule(
+      canonicalRuleId,
+      environment ?? undefined,
+    );
+    const existingLiveSchedule = liveSchedules[0];
+    if (params.version !== "new") {
+      await checkPatches(match, existingLiveSchedule, [
+        existingLiveSchedule,
+        ...(revision.rampActions ?? []).filter(
+          (a) =>
+            "ruleId" in a &&
+            (a.ruleId === canonicalRuleId || a.ruleId === ruleId),
+        ),
+      ]);
+    }
+
+    // Resolve the rollback anchor. An explicit `startState` is converted to
+    // startActions (merged onto the rule's current state); when omitted, the
+    // anchor is derived at publish from the rule's coverage — and we warn if
+    // that isn't 0% on create.
+    const startStateProvided = scheduleInput.startState !== undefined;
+    // A `force` the caller puts in startState is their input and is checked
+    // like a step value; the rest of the anchor is the rule's current state.
+    const startState = scheduleInput.startState as
+      | { force?: unknown }
+      | undefined;
+    if (startState && startState.force !== undefined) {
+      startState.force = normalizeRampActionsForceValues(
+        [{ patch: { force: startState.force } }],
+        feature,
+        "Start value",
+      )[0].patch.force;
+    }
+    const { startActions: resolvedStartActions, warning: startStateWarning } =
+      resolveRampStartState({
+        rule: match,
+        ruleId: canonicalRuleId,
+        startState: scheduleInput.startState as RampStartState | undefined,
+        isCreate: !existingLiveSchedule,
+      });
+    if (resolvedStartActions) {
+      scheduleInput.startActions = resolvedStartActions;
+    }
+    delete scheduleInput.startState;
+
+    const warnings: string[] = [];
+    if (startStateWarning) warnings.push(startStateWarning);
+    // The rollback anchor is only persisted while a schedule is pending/ready
+    // (see FeatureModel). Updating an already-active schedule's startState is a
+    // no-op, so tell the caller rather than returning a misleading success.
+    if (
+      startStateProvided &&
+      existingLiveSchedule &&
+      existingLiveSchedule.status !== "pending" &&
+      existingLiveSchedule.status !== "ready"
+    ) {
+      warnings.push(
+        `startState was ignored: ramp schedule "${existingLiveSchedule.id}" is "${existingLiveSchedule.status}", and the rollback anchor can only be changed while a schedule is pending or ready.`,
+      );
+    }
+
+    const action = await normalizeInlineRampSchedule(
+      context,
+      scheduleInput as Parameters<typeof normalizeInlineRampSchedule>[1],
+      canonicalRuleId,
+      feature,
+      {
+        /**
+         * startActions merged from `startState` are the rule's current state
+         * (its `force`, if sent, was checked above); caller-sent startActions
+         * without a startState are their own input and are checked.
+         */
+        validateStartActions: !startStateProvided,
+        previousMonitoringConfig: existingLiveSchedule?.monitoringConfig,
+      },
+    );
+
+    // Replace any existing pending ramp action for this rule. Filter tolerant
+    // to both the canonical id AND the caller-provided id, so stale entries
+    // written under either form (legacy buggy writes, or stem/suffix variants)
+    // get cleaned up on the next set.
+    const filtered = (revision.rampActions ?? []).filter(
+      (a) =>
+        !("ruleId" in a) ||
+        (a.ruleId !== canonicalRuleId && a.ruleId !== ruleId),
+    );
+    const revisionAction = existingLiveSchedule
+      ? ({
+          ...action,
+          mode: "update",
+          rampScheduleId: existingLiveSchedule.id,
+        } as RevisionRampUpdateAction)
+      : action;
+    const newRampActions = [...filtered, revisionAction];
+
+    // `changedEnvironments` drives the audit env fanout.
+    // When the caller didn't specify an env, use the resolved rule's full env
+    // footprint — semantically the ramp affects every env the rule covers.
+    const orgEnvs = getEnvironments(organization);
+    const applicableEnvs = getApplicableEnvIds(orgEnvs, feature);
+    const changedEnvironments = environment
+      ? [environment]
+      : ruleFootprint(match, applicableEnvs);
+
+    await updateRevision(
+      context,
+      feature,
+      revision,
+      { rampActions: newRampActions },
+      {
+        user: context.auditUser,
+        action: "set ramp schedule",
+        subject: canonicalRuleId,
+        value: JSON.stringify(revisionAction),
+      },
+    );
+
+    const updated = await getRevision({
+      context,
+      organization: organization.id,
+      featureId: feature.id,
+      feature,
+      version: revision.version,
+    });
+    const finalRevision = updated ?? revision;
+
+    await recordRevisionUpdate(
+      context,
+      feature,
+      finalRevision,
+      "rule.rampSchedule.set",
+      {
+        environments: changedEnvironments,
+        auditDetails: { ruleId: canonicalRuleId },
+      },
+    );
+
+    return {
+      feature,
+      revision: finalRevision,
+      warnings: warnings.length ? warnings : undefined,
+    };
+  } catch (err) {
+    await discardIfJustCreated(context, revision, created);
+    throw err;
+  }
+}
+
+export const putFeatureRevisionRuleRampSchedule = createApiRequestHandler(
+  putFeatureRevisionRuleRampScheduleValidator,
+)(async (req) => {
+  const { feature, revision, warnings } = await setRuleRampSchedule(
+    req.context,
+    req.organization,
+    req.params,
+    req.body,
+  );
+  return { revision: toApiRevision(revision, req.context, feature), warnings };
+});

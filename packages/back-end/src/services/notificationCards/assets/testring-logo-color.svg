@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1749" height="321" viewBox="0 0 1749 321">
+  <!-- 验环（TestRing）自研占位 Logo — MIT License。替代已删除的上游商业 Logo 文件 gb-logo-color.svg。 -->
+  <rect x="18" y="18" width="285" height="285" rx="64" fill="#DB314A"/>
+  <text x="160" y="218" text-anchor="middle" font-family="Inter, sans-serif" font-weight="600" font-size="190" fill="#FFFFFF">T</text>
+  <text x="360" y="218" font-family="Inter, sans-serif" font-weight="600" font-size="168" fill="#0F1B3D" letter-spacing="4">TestRing</text>
+  <circle cx="1560" cy="180" r="26" fill="#DB314A"/>
+</svg>

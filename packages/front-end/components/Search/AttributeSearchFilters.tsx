@@ -1,0 +1,235 @@
+import React, { FC, useMemo } from "react";
+import { Flex } from "@radix-ui/themes";
+import { SDKAttribute } from "shared/types/organization";
+import { CustomField } from "shared/types/custom-fields";
+import { attributeDataTypes } from "shared/constants";
+import {
+  BaseSearchFiltersProps,
+  FilterDropdown,
+  FilterItem,
+  FilterHeading,
+  useSearchFiltersBase,
+} from "@/components/Search/SearchFilters";
+import { DropdownMenu, DropdownMenuItem } from "@/ui/DropdownMenu";
+import Tag from "@/components/Tags/Tag";
+import { customFieldFilterValue } from "@/components/CustomFields/renderCustomFieldValue";
+
+export type AttributeWithId = SDKAttribute & {
+  id: string;
+  projectNames?: string[];
+};
+
+const AttributeSearchFilters: FC<
+  BaseSearchFiltersProps & {
+    attributes: AttributeWithId[];
+    customFields?: CustomField[];
+  }
+> = ({
+  searchInputProps,
+  syntaxFilters,
+  attributes,
+  setSearchValue,
+  customFields = [],
+}) => {
+  const {
+    dropdownFilterOpen,
+    setDropdownFilterOpen,
+    project,
+    projects,
+    updateQuery,
+    doesFilterExist,
+  } = useSearchFiltersBase({
+    searchInputProps,
+    syntaxFilters,
+    setSearchValue,
+  });
+
+  // Every dropdown offers only values some attribute actually carries, and a
+  // dropdown with nothing left to offer is not rendered at all.
+  const availableDatatypes = useMemo(() => {
+    const types = new Set(attributes.map((attr) => attr.datatype));
+    return attributeDataTypes
+      .filter((dt) => types.has(dt))
+      .map((dt) => ({ name: dt, id: "datatype-" + dt, searchValue: dt }));
+  }, [attributes]);
+
+  const availableProjects = useMemo(
+    () =>
+      projects.filter((p) =>
+        attributes.some((attr) => attr.projects?.includes(p.id)),
+      ),
+    [attributes, projects],
+  );
+
+  const availableTags = useMemo(() => {
+    const tags: string[] = [];
+    attributes.forEach((attr) => {
+      (attr.tags || []).forEach((tag) => {
+        if (!tags.includes(tag)) tags.push(tag);
+      });
+    });
+    return tags;
+  }, [attributes]);
+
+  const identifierItems = useMemo(
+    () =>
+      [
+        { searchValue: "yes", id: "identifier-yes", name: "Yes" },
+        { searchValue: "no", id: "identifier-no", name: "No" },
+      ].filter(({ searchValue }) =>
+        attributes.some(
+          (attr) => !!attr.hashAttribute === (searchValue === "yes"),
+        ),
+      ),
+    [attributes],
+  );
+
+  // Only fields with a known value set make sense as a dropdown; free-text
+  // fields are still reachable via `<fieldId>:value` in the search box.
+  const filterableCustomFields = useMemo(() => {
+    // Keyed by lowercase (how the query matches) but holding the value as
+    // written, so an option that isn't declared still displays as authored.
+    const used = new Map<string, Map<string, string>>();
+    attributes.forEach((attr) => {
+      customFields.forEach((f) => {
+        const values = customFieldFilterValue(
+          f,
+          attr.customFields?.[f.id] ?? "",
+        );
+        const seen = used.get(f.id) ?? new Map<string, string>();
+        (Array.isArray(values) ? values : [values]).forEach((v) => {
+          if (v && !seen.has(v.toLowerCase())) seen.set(v.toLowerCase(), v);
+        });
+        used.set(f.id, seen);
+      });
+    });
+    return customFields.flatMap((f) => {
+      const seen = used.get(f.id) ?? new Map<string, string>();
+      if (f.type === "boolean") {
+        // Display casing matches the Identifier filter on the same bar; the
+        // query value stays lowercase.
+        const values = [
+          { name: "Yes", searchValue: "yes" },
+          { name: "No", searchValue: "no" },
+        ].filter((v) => seen.has(v.searchValue));
+        return values.length ? [{ field: f, values }] : [];
+      }
+      if (f.type !== "enum" && f.type !== "multiselect") return [];
+      const declared = (f.values ?? "")
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean);
+      const declaredKeys = new Set(declared.map((v) => v.toLowerCase()));
+      // Declared order first, then anything else in use: a `creatable` field
+      // accepts values beyond its declared list.
+      const values = [
+        ...declared.filter((v) => seen.has(v.toLowerCase())),
+        ...[...seen]
+          .filter(([key]) => !declaredKeys.has(key))
+          .map(([, v]) => v),
+      ].map((v) => ({ name: v, searchValue: v }));
+      return values.length ? [{ field: f, values }] : [];
+    });
+  }, [attributes, customFields]);
+
+  return (
+    // Wraps within itself rather than dropping the whole group below the
+    // search field: a custom field adds a dropdown, so this row is unbounded.
+    <Flex gapX="5" gapY="2" align="center" wrap="wrap" justify="end">
+      {!project && availableProjects.length > 0 && (
+        <FilterDropdown
+          filter="project"
+          syntaxFilters={syntaxFilters}
+          open={dropdownFilterOpen}
+          setOpen={setDropdownFilterOpen}
+          items={availableProjects.map((p) => ({
+            name: p.name,
+            id: p.id,
+            searchValue: p.name,
+          }))}
+          updateQuery={updateQuery}
+        />
+      )}
+      {availableDatatypes.length > 0 && (
+        <FilterDropdown
+          filter="datatype"
+          heading="data type"
+          syntaxFilters={syntaxFilters}
+          open={dropdownFilterOpen}
+          setOpen={setDropdownFilterOpen}
+          items={availableDatatypes}
+          updateQuery={updateQuery}
+        />
+      )}
+      {availableTags.length > 0 && (
+        <FilterDropdown
+          filter="tag"
+          syntaxFilters={syntaxFilters}
+          open={dropdownFilterOpen}
+          setOpen={setDropdownFilterOpen}
+          items={availableTags.map((t) => ({
+            name: <Tag tag={t} key={t} skipMargin={true} variant="dot" />,
+            id: t,
+            searchValue: t,
+          }))}
+          updateQuery={updateQuery}
+        />
+      )}
+      {identifierItems.length > 0 && (
+        <FilterDropdown
+          filter="identifier"
+          syntaxFilters={syntaxFilters}
+          open={dropdownFilterOpen}
+          setOpen={setDropdownFilterOpen}
+          items={identifierItems}
+          updateQuery={updateQuery}
+        />
+      )}
+      {filterableCustomFields.map(({ field, values }) => (
+        <FilterDropdown
+          key={field.id}
+          filter={field.id.toLowerCase()}
+          heading={field.name.toLowerCase()}
+          syntaxFilters={syntaxFilters}
+          open={dropdownFilterOpen}
+          setOpen={setDropdownFilterOpen}
+          items={values.map(({ name, searchValue }) => ({
+            name,
+            id: `${field.id}-${searchValue}`,
+            searchValue,
+          }))}
+          updateQuery={updateQuery}
+        />
+      ))}
+      {/* Always offered: with nothing archived it is still the way to undo the filter. */}
+      <DropdownMenu
+        trigger={FilterHeading({
+          heading: "more",
+          open: dropdownFilterOpen === "more",
+        })}
+        open={dropdownFilterOpen === "more"}
+        onOpenChange={(o) => {
+          setDropdownFilterOpen(o ? "more" : "");
+        }}
+      >
+        <DropdownMenuItem
+          onClick={() => {
+            updateQuery({
+              field: "is",
+              values: ["archived"],
+              operator: "",
+              negated: false,
+            });
+          }}
+        >
+          <FilterItem
+            item="Archived attributes"
+            exists={doesFilterExist("is", "archived", "")}
+          />
+        </DropdownMenuItem>
+      </DropdownMenu>
+    </Flex>
+  );
+};
+
+export default AttributeSearchFilters;

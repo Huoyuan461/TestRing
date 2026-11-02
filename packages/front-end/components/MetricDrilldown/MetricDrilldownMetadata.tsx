@@ -1,0 +1,228 @@
+import { Flex, Tooltip } from "@radix-ui/themes";
+import { MdSwapCalls } from "react-icons/md";
+import {
+  getLowerCappingSettings,
+  isAbsoluteCappedMetric,
+  isFactMetric,
+  isLowerAbsoluteCappedMetric,
+  isLowerPercentileCappedMetric,
+  isUpperPercentileCappedMetric,
+  quantileMetricType,
+} from "shared/experiments";
+import { LookbackOverride } from "shared/validators";
+import { DEFAULT_PROPER_PRIOR_STDDEV } from "shared/constants";
+import { StatsEngine } from "shared/types/stats";
+import { date } from "shared/dates";
+import Metadata from "@/ui/Metadata";
+import FactMetricTypeDisplayName from "@/components/Metrics/FactMetricTypeDisplayName";
+import { getPercentileLabel } from "@/services/metrics";
+import {
+  capitalizeFirstLetter,
+  isNullUndefinedOrEmpty,
+} from "@/services/utils";
+import { ExperimentTableRow } from "@/services/experiments";
+
+/** Percentile value shown as a percentage, with an optional zero-handling note. */
+function formatPercentileCap(
+  value: number | undefined,
+  ignoreZeros: boolean | null | undefined,
+) {
+  return `${100 * (value as number)}%${ignoreZeros ? " (ignore zeros)" : ""}`;
+}
+
+export function MetricDrilldownMetadata({
+  statsEngine,
+  lookbackOverride,
+  row,
+}: {
+  statsEngine: StatsEngine;
+  lookbackOverride?: LookbackOverride;
+  row: ExperimentTableRow;
+}) {
+  const { metric, metricOverrideFields, metricSnapshotSettings } = row;
+
+  const cappingSettings = metric.cappingSettings;
+  const lowerCappingSettings = getLowerCappingSettings(metric);
+
+  return (
+    <Flex gap="4">
+      <Metadata
+        label="Type"
+        value={
+          <Flex gap="1" align="center">
+            <FactMetricTypeDisplayName metric={metric} />
+            {metric.inverse ? (
+              <Tooltip content="Metric is inverse, lower is better">
+                <span>
+                  <MdSwapCalls />
+                </span>
+              </Tooltip>
+            ) : null}
+          </Flex>
+        }
+      />
+
+      {quantileMetricType(metric) !== "" ? (
+        <>
+          <Metadata
+            label="Quantile"
+            value={
+              isFactMetric(metric) && metric.quantileSettings
+                ? getPercentileLabel(metric.quantileSettings.quantile)
+                : null
+            }
+          />
+          <Metadata
+            label="Quantile Type"
+            value={
+              isFactMetric(metric) && metric.quantileSettings
+                ? `${
+                    metric.quantileSettings.type === "unit"
+                      ? "Per-user"
+                      : "Events"
+                  }${
+                    metric.quantileSettings.ignoreZeros
+                      ? " (ignoring zeros)"
+                      : ""
+                  }`
+                : null
+            }
+          />
+        </>
+      ) : null}
+
+      {isUpperPercentileCappedMetric(metric) ? (
+        <Metadata
+          label="Percentile (ceiling)"
+          value={formatPercentileCap(
+            cappingSettings.value,
+            cappingSettings.ignoreZeros,
+          )}
+        />
+      ) : isAbsoluteCappedMetric(metric) ? (
+        <Metadata
+          label="Maximum user value"
+          value={`${cappingSettings.value}`}
+        />
+      ) : null}
+
+      {isLowerPercentileCappedMetric(metric) ? (
+        <Metadata
+          label="Percentile (floor)"
+          value={formatPercentileCap(
+            lowerCappingSettings?.value,
+            lowerCappingSettings?.ignoreZeros,
+          )}
+        />
+      ) : isLowerAbsoluteCappedMetric(metric) ? (
+        <Metadata
+          label="Minimum user value"
+          value={`${lowerCappingSettings?.value}`}
+        />
+      ) : null}
+
+      {/* Brute force show override from latest experiment settings, but we could instead show computed window from 
+      metricForSnapshot, but would require potentially reconstructing more settings*/}
+      {lookbackOverride ? (
+        <Metadata
+          label="Lookback Window Override"
+          value={
+            lookbackOverride.type === "date"
+              ? `${date(lookbackOverride.value, "UTC")} - now/end`
+              : `${lookbackOverride.value} ${lookbackOverride.valueUnit}`
+          }
+        />
+      ) : (!isNullUndefinedOrEmpty(metric.windowSettings.type) ||
+          metricOverrideFields.includes("windowType")) &&
+        (metric.windowSettings.windowValue !== 0 ||
+          metricOverrideFields.includes("windowHours")) ? (
+        <Metadata
+          label={`${capitalizeFirstLetter(
+            metric.windowSettings.type || "no",
+          )} Window`}
+          value={
+            <>
+              {metric.windowSettings.type
+                ? `${metric.windowSettings.windowValue} ${metric.windowSettings.windowUnit}`
+                : ""}
+              {metricOverrideFields.includes("windowType") ||
+              metricOverrideFields.includes("windowHours") ? (
+                <small className="text-purple ml-1">(override)</small>
+              ) : null}
+            </>
+          }
+        />
+      ) : null}
+
+      {(metric.windowSettings.delayValue ?? 0) !== 0 ||
+      metricOverrideFields.includes("delayHours") ? (
+        <Metadata
+          label={
+            isFactMetric(metric) && metric.metricType === "retention"
+              ? "Retention Window"
+              : "Metric Delay"
+          }
+          value={
+            <>
+              {`${metric.windowSettings.delayValue} ${metric.windowSettings.delayUnit}`}
+              {metricOverrideFields.includes("delayHours") ? (
+                <small className="text-purple ml-1">(override)</small>
+              ) : null}
+            </>
+          }
+        />
+      ) : null}
+
+      {statsEngine === "bayesian" ? (
+        <Metadata
+          label="Bayesian Prior"
+          value={
+            <>
+              {metricSnapshotSettings?.properPrior
+                ? `Mean: ${
+                    metricSnapshotSettings?.properPriorMean ?? 0
+                  }, Std. Dev.: ${
+                    metricSnapshotSettings?.properPriorStdDev ??
+                    DEFAULT_PROPER_PRIOR_STDDEV
+                  }`
+                : "Disabled"}
+              {metricOverrideFields.includes("prior") ? (
+                <small className="text-purple ml-1">(override)</small>
+              ) : null}
+            </>
+          }
+        />
+      ) : null}
+
+      {metricSnapshotSettings ? (
+        <Metadata
+          label="CUPED"
+          value={
+            <>
+              {metricSnapshotSettings?.regressionAdjustmentEnabled
+                ? "Enabled"
+                : "Disabled"}
+              {metricOverrideFields.includes("regressionAdjustmentEnabled") ? (
+                <small className="text-purple ml-1">(override)</small>
+              ) : null}
+            </>
+          }
+        />
+      ) : null}
+
+      {metricSnapshotSettings?.regressionAdjustmentEnabled ? (
+        <Metadata
+          label="CUPED Lookback (days)"
+          value={
+            <>
+              {metricSnapshotSettings?.regressionAdjustmentDays}
+              {metricOverrideFields.includes("regressionAdjustmentDays") ? (
+                <small className="text-purple ml-1">(override)</small>
+              ) : null}
+            </>
+          }
+        />
+      ) : null}
+    </Flex>
+  );
+}

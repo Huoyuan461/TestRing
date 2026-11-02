@@ -1,0 +1,210 @@
+import type { OrganizationInterface } from "shared/types/organization";
+import type { JSONSchemaDef } from "shared/types/feature";
+import { normalizeTargetingInUpdates } from "shared/util";
+import { putFeatureRevisionMetadataValidator } from "shared/validators";
+import { RevisionChanges } from "shared/types/feature-revision";
+import {
+  assertTargetingDestination,
+  withStagedTargeting,
+} from "shared/permissions";
+import type { ApiReqContext } from "back-end/types/api";
+import { toApiRevision } from "back-end/src/services/features";
+import { recordRevisionUpdate } from "back-end/src/services/featureRevisionEvents";
+import { BadRequestError, NotFoundError } from "back-end/src/util/errors";
+import { createApiRequestHandler } from "back-end/src/util/handler";
+import { stampApiJsonSchema } from "back-end/src/util/feature-json-schema";
+import { getFeature } from "back-end/src/models/FeatureModel";
+import {
+  getRevision,
+  updateRevision,
+} from "back-end/src/models/FeatureRevisionModel";
+import { holdsMoveDestination } from "back-end/src/revisions/moveAuthority";
+import { stagingTargetingBase } from "back-end/src/revisions/featureDraftAuthority";
+import {
+  discardIfJustCreated,
+  isDraftStatus,
+  validateCustomFields,
+  resolveOrCreateRevision,
+} from "./validations";
+import { assertConfigSchemaCompat, assertValidProjectIds } from "./v2Shared";
+
+export type RevisionMetadataBody = {
+  comment?: string;
+  title?: string;
+  description?: string;
+  owner?: unknown;
+  project?: string;
+  targetingAllProjects?: boolean;
+  targetingProjects?: string[];
+  tags?: string[];
+  neverStale?: boolean;
+  customFields?: Record<string, unknown>;
+  jsonSchema?: Omit<JSONSchemaDef, "date"> & { date?: Date };
+  [k: string]: unknown;
+};
+
+export async function setRevisionMetadata(
+  context: ApiReqContext,
+  organization: OrganizationInterface,
+  params: { id: string; version: number | "new" },
+  body: RevisionMetadataBody,
+) {
+  const feature = await getFeature(context, params.id);
+  if (!feature) throw new NotFoundError("Could not find feature");
+
+  if (!context.permissions.canEditFeatureDrafts(feature)) {
+    context.permissions.throwPermissionError();
+  }
+
+  const { comment, title, ...metadataFields } = body;
+
+  if (
+    metadataFields.project !== undefined &&
+    metadataFields.project !== feature.project
+  ) {
+    if (
+      context.org.settings?.requireProjectForFeatures &&
+      feature.project &&
+      metadataFields.project === ""
+    ) {
+      throw new BadRequestError("Must specify a project");
+    }
+
+    if (metadataFields.project) {
+      await context.models.projects.ensureProjectsExist([
+        metadataFields.project,
+      ]);
+    }
+
+    // Draft moves require draft authority in the destination.
+    if (
+      !holdsMoveDestination({
+        permissions: context.permissions,
+        model: "feature",
+        action: "draft",
+        existing: feature,
+        proposed: { ...feature, project: metadataFields.project },
+      })
+    ) {
+      context.permissions.throwPermissionError();
+    }
+  }
+
+  if (metadataFields.customFields !== undefined) {
+    await validateCustomFields(
+      metadataFields.customFields as Record<string, unknown>,
+      context,
+      metadataFields.project ?? feature.project,
+    );
+  }
+
+  if (metadataFields.jsonSchema) {
+    if (
+      metadataFields.jsonSchema.enabled &&
+      !context.hasPremiumFeature("json-validation")
+    ) {
+      context.throwPlanDoesNotAllowError(
+        "JSON schema validation requires a premium plan.",
+      );
+    }
+    assertConfigSchemaCompat({
+      jsonSchemaEnabled: metadataFields.jsonSchema.enabled,
+      baseConfig: feature.baseConfig,
+    });
+    metadataFields.jsonSchema = stampApiJsonSchema(
+      metadataFields.jsonSchema,
+      feature.valueType,
+    );
+  }
+
+  const { revision, created } = await resolveOrCreateRevision(
+    context,
+    organization.id,
+    feature,
+    params.version,
+    { title, comment },
+  );
+
+  try {
+    if (!isDraftStatus(revision.status)) {
+      throw new BadRequestError(
+        `Cannot edit a revision with status "${revision.status}"`,
+      );
+    }
+
+    const draft = created ? null : revision;
+    const stagedTargeting = withStagedTargeting(feature, draft?.metadata);
+    normalizeTargetingInUpdates(metadataFields, stagedTargeting);
+    assertTargetingDestination({
+      permissions: context.permissions,
+      existing: await stagingTargetingBase(context, feature, draft),
+      proposed: withStagedTargeting(stagedTargeting, metadataFields),
+      optedOut: await context.getTargetingOptOutProjectIds(),
+    });
+    // After the gate so an unreadable id cannot be probed for existence.
+    await assertValidProjectIds(metadataFields.targetingProjects, context);
+
+    const changes: RevisionChanges = {};
+    if (comment !== undefined) changes.comment = comment;
+    if (title !== undefined) changes.title = title;
+
+    if (Object.keys(metadataFields).length > 0) {
+      // Merge into the existing metadata snapshot so omitted fields persist.
+      changes.metadata = {
+        ...(revision.metadata ?? {}),
+        ...(metadataFields as Partial<
+          NonNullable<RevisionChanges["metadata"]>
+        >),
+      };
+    }
+
+    if (Object.keys(changes).length === 0) {
+      // No-op: drop any auto-created draft so it doesn't leak.
+      await discardIfJustCreated(context, revision, created);
+      return { feature, revision };
+    }
+
+    // Tags are registered in the org's tag collection on publish (not here)
+    // so discarded drafts don't leak orphaned tags.
+    await updateRevision(context, feature, revision, changes, {
+      user: context.auditUser,
+      action: "edit metadata",
+      subject: "",
+      value: JSON.stringify(changes),
+    });
+
+    const updated = await getRevision({
+      context,
+      organization: organization.id,
+      featureId: feature.id,
+      feature,
+      version: revision.version,
+    });
+    const finalRevision = updated ?? revision;
+
+    await recordRevisionUpdate(context, feature, finalRevision, "metadata", {
+      // No environment-scoped impact — see recordRevisionUpdate. Omitting this lets
+      // routing derive environments from the revision's RULES, sending a metadata
+      // edit to every environment-filtered subscriber those rules touch.
+      environments: [],
+      auditDetails: { fields: Object.keys(changes) },
+    });
+
+    return { feature, revision: finalRevision };
+  } catch (err) {
+    await discardIfJustCreated(context, revision, created);
+    throw err;
+  }
+}
+
+export const putFeatureRevisionMetadata = createApiRequestHandler(
+  putFeatureRevisionMetadataValidator,
+)(async (req) => {
+  const { feature, revision } = await setRevisionMetadata(
+    req.context,
+    req.organization,
+    req.params,
+    req.body,
+  );
+  return { revision: toApiRevision(revision, req.context, feature) };
+});

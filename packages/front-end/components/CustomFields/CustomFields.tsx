@@ -1,0 +1,395 @@
+import { FC, useEffect, useMemo, useState } from "react";
+import { CustomField, CustomFieldSection } from "shared/types/custom-fields";
+import { ALL_SECTIONS } from "shared/validators";
+import {
+  closestCenter,
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { Box } from "@radix-ui/themes";
+import { useAuth } from "@/services/auth";
+import track from "@/services/track";
+import {
+  CustomFieldColGroup,
+  SortableCustomFieldRow,
+  StaticCustomFieldRow,
+} from "@/components/CustomFields/SortableCustomField";
+import Table, {
+  TableBody,
+  TableCell,
+  TableColumnHeader,
+  TableHeader,
+  TableRow,
+} from "@/ui/Table";
+import CustomFieldModal from "@/components/CustomFields/CustomFieldModal";
+import { useDefinitions } from "@/services/DefinitionsContext";
+import usePermissionsUtil from "@/hooks/usePermissionsUtils";
+import Button from "@/ui/Button";
+import Link from "@/ui/Link";
+import Text from "@/ui/Text";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/ui/Tabs";
+import useURLHash from "@/hooks/useURLHash";
+import { SettingsPageHeader } from "@/components/Layout/SettingsPage";
+
+export type AppliesToFilter = "all" | CustomFieldSection;
+export { CUSTOM_FIELD_SECTION_LABELS } from "@/components/CustomFields/constants";
+
+/** FE-only: array index for delete disambiguation (legacy duplicate ids) */
+export type CustomFieldWithArrayIndex = CustomField & { arrayIndex: number };
+
+function CustomFieldsTable({
+  filter,
+  items,
+  duplicateIds,
+  showRequired,
+  deleteCustomField,
+  toggleCustomField,
+  setModalOpen,
+  handleMoveUp,
+  handleMoveDown,
+  canManage,
+}: {
+  filter: AppliesToFilter;
+  items: CustomFieldWithArrayIndex[];
+  duplicateIds: Set<string>;
+  showRequired: boolean;
+  deleteCustomField: (cf: CustomFieldWithArrayIndex) => Promise<void>;
+  toggleCustomField: (cf: CustomFieldWithArrayIndex) => Promise<void>;
+  setModalOpen: (v: Partial<CustomField> | null) => void;
+  handleMoveUp: (moveId: string, aboveId: string) => void;
+  handleMoveDown: (moveId: string, belowId: string) => void;
+  canManage: boolean;
+}) {
+  const colSpan = 7 + 1 + (showRequired ? 1 : 0); // +1 for menu
+
+  const filteredItems = useMemo(() => {
+    if (filter === "all") return items;
+    return items.filter((cf) => cf.sections?.includes(filter));
+  }, [items, filter]);
+
+  const openAddModal = () =>
+    setModalOpen(
+      filter === "all" ? {} : { sections: [filter as CustomFieldSection] },
+    );
+
+  return (
+    <Table
+      variant="list"
+      stickyHeader={false}
+      roundedCorners
+      layout="fixed"
+      className="appbox"
+    >
+      <CustomFieldColGroup showRequired={showRequired} />
+      <TableHeader>
+        <TableRow>
+          <TableColumnHeader />
+          <TableColumnHeader>Field Name</TableColumnHeader>
+          <TableColumnHeader>Field Key</TableColumnHeader>
+          <TableColumnHeader>Description</TableColumnHeader>
+          <TableColumnHeader>Applies To</TableColumnHeader>
+          <TableColumnHeader>Value Type</TableColumnHeader>
+          <TableColumnHeader>Projects</TableColumnHeader>
+          {showRequired && <TableColumnHeader>Required</TableColumnHeader>}
+          <TableColumnHeader />
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {filteredItems.length > 0 ? (
+          <SortableContext
+            items={filteredItems}
+            strategy={verticalListSortingStrategy}
+          >
+            {filteredItems.map((v, filteredIndex) => (
+              <SortableCustomFieldRow
+                key={`${v.id}-${v.arrayIndex}`}
+                customField={v}
+                deleteCustomField={deleteCustomField}
+                toggleCustomField={toggleCustomField}
+                setEditModal={setModalOpen}
+                canMoveUp={filteredIndex > 0}
+                canMoveDown={filteredIndex < filteredItems.length - 1}
+                onMoveUp={() =>
+                  handleMoveUp(v.id, filteredItems[filteredIndex - 1]!.id)
+                }
+                onMoveDown={() =>
+                  handleMoveDown(v.id, filteredItems[filteredIndex + 1]!.id)
+                }
+                canManage={canManage}
+                showRequired={showRequired}
+                isDuplicateId={duplicateIds.has(v.id)}
+              />
+            ))}
+          </SortableContext>
+        ) : (
+          <TableRow>
+            <TableCell colSpan={colSpan}>
+              <Text as="div" align="center" color="text-low">
+                <em>
+                  No custom fields in this view.{" "}
+                  {canManage ? (
+                    <Link onClick={openAddModal}>Add custom field</Link>
+                  ) : null}
+                </em>
+              </Text>
+            </TableCell>
+          </TableRow>
+        )}
+      </TableBody>
+    </Table>
+  );
+}
+
+const TAB_VALUES = ["all", "feature", "experiment", "attribute"] as const;
+
+const CustomFields: FC = () => {
+  const [activeFilter, setActiveFilter] = useURLHash(TAB_VALUES);
+  const [modalOpen, setModalOpen] = useState<Partial<CustomField> | null>(null);
+  const { customFields, mutateDefinitions } = useDefinitions();
+  const { apiCall } = useAuth();
+  const [activeId, setActiveId] = useState<string | undefined>();
+  const [items, setItems] = useState<CustomFieldWithArrayIndex[]>(() =>
+    (customFields ?? []).map((cf, i) => ({ ...cf, arrayIndex: i })),
+  );
+  const permissionsUtils = usePermissionsUtil();
+
+  useEffect(() => {
+    setItems((customFields ?? []).map((cf, i) => ({ ...cf, arrayIndex: i })));
+  }, [customFields]);
+
+  const selectedRow = useMemo(() => {
+    if (!activeId) return null;
+    return items?.find((cf) => cf.id === activeId) ?? null;
+  }, [activeId, items]);
+
+  const deleteCustomField = async (customField: CustomFieldWithArrayIndex) => {
+    await apiCall(
+      `/custom-fields/${customField.id}?index=${customField.arrayIndex}`,
+      {
+        method: "DELETE",
+      },
+    ).then(() => {
+      track("Delete Custom Field", { type: customField.type });
+      mutateDefinitions();
+    });
+  };
+
+  const toggleCustomField = async (customField: CustomFieldWithArrayIndex) => {
+    await apiCall(`/custom-fields/${customField.id}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        name: customField.name,
+        description: customField.description,
+        placeholder: customField.placeholder,
+        defaultValue: customField.defaultValue,
+        values: customField.values,
+        required: customField.required,
+        projects: customField.projects,
+        sections: customField.sections,
+        active: (customField.active ?? true) === false,
+      }),
+    }).then(() => mutateDefinitions());
+  };
+
+  const reorderFields = async (oldId: string, newId: string) => {
+    await apiCall(`/custom-fields/reorder`, {
+      method: "POST",
+      body: JSON.stringify({ oldId, newId }),
+    }).then(() => mutateDefinitions());
+  };
+
+  const sensors = useSensors(
+    useSensor(MouseSensor, {}),
+    useSensor(TouchSensor, {}),
+    useSensor(KeyboardSensor, {}),
+  );
+
+  function handleDragStart(event: { active: { id: string } }) {
+    setActiveId(event.active.id);
+  }
+
+  async function handleDragEnd(event: {
+    active: { id: string };
+    over: { id: string } | null;
+  }) {
+    if (!items) {
+      setActiveId(undefined);
+      return;
+    }
+    const { active, over } = event;
+    if (over && active.id !== over.id) {
+      const oldIndex = items.findIndex((x) => x.id === active.id);
+      const newIndex = items.findIndex((x) => x.id === over.id);
+      if (oldIndex >= 0 && newIndex >= 0) {
+        const reordered = arrayMove(items, oldIndex, newIndex);
+        setItems(reordered.map((cf, i) => ({ ...cf, arrayIndex: i })));
+        await reorderFields(String(active.id), String(over.id));
+      }
+    }
+    setActiveId(undefined);
+  }
+
+  function handleDragCancel() {
+    setActiveId(undefined);
+  }
+
+  const handleMoveUp = (moveId: string, aboveId: string) =>
+    reorderFields(moveId, aboveId);
+
+  const handleMoveDown = (moveId: string, belowId: string) =>
+    reorderFields(moveId, belowId);
+
+  const canManage = permissionsUtils.canManageCustomFields();
+
+  const duplicateIds = useMemo(() => {
+    const seen = new Set<string>();
+    const dupes = new Set<string>();
+    for (const cf of items) {
+      if (seen.has(cf.id)) dupes.add(cf.id);
+      else seen.add(cf.id);
+    }
+    return dupes;
+  }, [items]);
+
+  return (
+    <>
+      <Box mb="5">
+        <SettingsPageHeader
+          title="Custom Fields"
+          description="Add custom metadata to feature flags, experiments, and targeting attributes. Choose which of those each field applies to."
+          actions={
+            canManage && (
+              <Button
+                onClick={() => {
+                  setModalOpen({});
+                }}
+              >
+                Add Custom Field
+              </Button>
+            )
+          }
+        />
+        <DndContext
+          sensors={sensors}
+          onDragEnd={handleDragEnd}
+          onDragStart={handleDragStart}
+          onDragCancel={handleDragCancel}
+          collisionDetection={closestCenter}
+        >
+          <Tabs
+            value={activeFilter ?? "all"}
+            onValueChange={(v) => setActiveFilter(v as AppliesToFilter)}
+          >
+            <Box mb="4">
+              <TabsList>
+                <TabsTrigger value="all">All</TabsTrigger>
+                <TabsTrigger value="feature">Feature</TabsTrigger>
+                <TabsTrigger value="experiment">Experiment</TabsTrigger>
+                <TabsTrigger value="attribute">Attribute</TabsTrigger>
+              </TabsList>
+            </Box>
+            <TabsContent value="all">
+              <CustomFieldsTable
+                filter="all"
+                items={items}
+                duplicateIds={duplicateIds}
+                showRequired={true}
+                deleteCustomField={deleteCustomField}
+                toggleCustomField={toggleCustomField}
+                setModalOpen={setModalOpen}
+                handleMoveUp={handleMoveUp}
+                handleMoveDown={handleMoveDown}
+                canManage={canManage}
+              />
+            </TabsContent>
+            <TabsContent value="feature">
+              <CustomFieldsTable
+                filter="feature"
+                items={items}
+                duplicateIds={duplicateIds}
+                showRequired={true}
+                deleteCustomField={deleteCustomField}
+                toggleCustomField={toggleCustomField}
+                setModalOpen={setModalOpen}
+                handleMoveUp={handleMoveUp}
+                handleMoveDown={handleMoveDown}
+                canManage={canManage}
+              />
+            </TabsContent>
+            <TabsContent value="experiment">
+              <CustomFieldsTable
+                filter="experiment"
+                items={items}
+                duplicateIds={duplicateIds}
+                showRequired={true}
+                deleteCustomField={deleteCustomField}
+                toggleCustomField={toggleCustomField}
+                setModalOpen={setModalOpen}
+                handleMoveUp={handleMoveUp}
+                handleMoveDown={handleMoveDown}
+                canManage={canManage}
+              />
+            </TabsContent>
+            <TabsContent value="attribute">
+              <CustomFieldsTable
+                filter="attribute"
+                items={items}
+                duplicateIds={duplicateIds}
+                showRequired={true}
+                deleteCustomField={deleteCustomField}
+                toggleCustomField={toggleCustomField}
+                setModalOpen={setModalOpen}
+                handleMoveUp={handleMoveUp}
+                handleMoveDown={handleMoveDown}
+                canManage={canManage}
+              />
+            </TabsContent>
+          </Tabs>
+          <DragOverlay>
+            {activeId && selectedRow ? (
+              <Table
+                variant="list"
+                stickyHeader={false}
+                layout="fixed"
+                style={{ width: "100%" }}
+              >
+                <CustomFieldColGroup showRequired={true} />
+                <TableBody>
+                  <StaticCustomFieldRow
+                    customField={selectedRow}
+                    showRequired={true}
+                  />
+                </TableBody>
+              </Table>
+            ) : null}
+          </DragOverlay>
+        </DndContext>
+      </Box>
+      {modalOpen !== null && (
+        <CustomFieldModal
+          existing={modalOpen}
+          defaultSections={
+            modalOpen.sections ??
+            (activeFilter === "all"
+              ? [...ALL_SECTIONS]
+              : [activeFilter as CustomFieldSection])
+          }
+          close={() => setModalOpen(null)}
+          onSuccess={mutateDefinitions}
+        />
+      )}
+    </>
+  );
+};
+
+export default CustomFields;

@@ -1,0 +1,347 @@
+import { VisualChangesetInterface } from "shared/types/visual-changeset";
+import { FC, useState } from "react";
+import { useFieldArray, useForm } from "react-hook-form";
+import { ExperimentInterfaceStringDates } from "shared/types/experiment";
+import { FaInfoCircle } from "react-icons/fa";
+import { isURLTargeted, UrlTarget } from "@growthbook/growthbook";
+import SelectField from "@/components/Forms/SelectField";
+import { useAuth } from "@/services/auth";
+import Tooltip from "@/components/Tooltip/Tooltip";
+import Field from "@/components/Forms/Field";
+import { GBAddCircle } from "@/components/Icons";
+import ModalStandard from "@/ui/Modal/Patterns/ModalStandard";
+import Callout from "@/ui/Callout";
+import { VisualTargeting } from "@/components/Experiment/TabbedPage/linkedChangesDraft";
+
+const defaultType = "simple";
+
+type CreatedVisualChangeset = Pick<
+  VisualChangesetInterface,
+  "id" | "editorUrl"
+>;
+
+type Props = {
+  close: () => void;
+  cta?: string;
+  source?: string;
+} & (
+  | {
+      mode: "add";
+      experiment: ExperimentInterfaceStringDates;
+      create?: never;
+      mutate: () => void;
+      onCreate?: (vc: CreatedVisualChangeset) => void;
+      visualChangeset?: never;
+      stage?: never;
+    }
+  | {
+      // For an owner other than an experiment, which creates it itself.
+      mode: "add";
+      experiment?: never;
+      create: (payload: VisualTargeting) => Promise<{
+        visualChangeset?: Partial<CreatedVisualChangeset>;
+      } | void>;
+      mutate: () => void;
+      onCreate?: (vc: CreatedVisualChangeset) => void;
+      visualChangeset?: never;
+      stage?: never;
+    }
+  | {
+      mode: "edit";
+      visualChangeset: VisualChangesetInterface;
+      // Hands the targeting to the page, which saves it with the rest.
+      stage: (targeting: VisualTargeting) => void;
+      mutate?: never;
+      onCreate?: never;
+    }
+  | {
+      mode: "edit";
+      visualChangeset: VisualChangesetInterface;
+      stage?: never;
+      mutate: () => void;
+      onCreate?: never;
+    }
+);
+
+const VisualChangesetModal: FC<Props> = (props) => {
+  const { mode, visualChangeset, close, source } = props;
+  const { apiCall } = useAuth();
+
+  let forceAdvancedMode = false;
+  if ((visualChangeset?.urlPatterns?.length ?? 0) > 0) {
+    forceAdvancedMode = true;
+  }
+  if (visualChangeset?.urlPatterns?.length === 1) {
+    const p = visualChangeset.urlPatterns[0];
+    if (
+      p.pattern === visualChangeset.editorUrl &&
+      p.type === defaultType &&
+      p.include
+    ) {
+      forceAdvancedMode = false;
+    }
+  }
+
+  const [showAdvanced, setShowAdvanced] = useState(forceAdvancedMode);
+
+  const form = useForm({
+    defaultValues: {
+      editorUrl: visualChangeset?.editorUrl ?? "",
+      urlPatterns: visualChangeset?.urlPatterns ?? [
+        { pattern: "", type: defaultType, include: true },
+      ],
+    },
+  });
+  const urlPatterns = useFieldArray({
+    control: form.control,
+    name: "urlPatterns",
+  });
+
+  const onSubmit = form.handleSubmit(async (value) => {
+    const payload: VisualTargeting = {
+      editorUrl: value.editorUrl,
+      urlPatterns: value.urlPatterns.map((p) => ({
+        ...p,
+        type: p.type === "regex" ? "regex" : "simple",
+      })),
+    };
+    if (!showAdvanced) {
+      payload.urlPatterns = [
+        { pattern: value.editorUrl, type: defaultType, include: true },
+      ];
+    }
+    if (props.mode === "edit") {
+      if (props.stage) {
+        props.stage(payload);
+        return;
+      }
+      await apiCall(`/visual-changesets/${props.visualChangeset.id}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      props.mutate?.();
+      return;
+    }
+    if (props.create) {
+      const res = await props.create(payload);
+      props.mutate();
+      const vc = res?.visualChangeset;
+      if (vc?.id && vc.editorUrl) {
+        props.onCreate?.({ id: vc.id, editorUrl: vc.editorUrl });
+      }
+      return;
+    }
+    const res = await apiCall<{ visualChangeset: VisualChangesetInterface }>(
+      `/experiments/${props.experiment?.id}/visual-changeset`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+    props.mutate();
+    if (res.visualChangeset) props.onCreate?.(res.visualChangeset);
+  });
+
+  const editorUrlLabel = !showAdvanced
+    ? "Target URL"
+    : "URL to edit with AI Visual Editor";
+  const editorUrlHelpText = !showAdvanced ? undefined : (
+    <>
+      Clicking the <strong>Open AI Visual Editor</strong> button will open this
+      URL
+    </>
+  );
+
+  const patternsMatchUrl =
+    !showAdvanced ||
+    isURLTargeted(
+      form.watch("editorUrl"),
+      form.watch("urlPatterns") as UrlTarget[],
+    );
+
+  return (
+    <ModalStandard
+      trackingEventModalType="visual-changeset-modal"
+      trackingEventModalSource={source}
+      open
+      close={close}
+      size="lg"
+      header={`${
+        mode === "add" ? "Add" : "Modify"
+      } Visual Changes URL targeting`}
+      submit={onSubmit}
+      cta={props.mode === "edit" && props.stage ? "Apply" : props.cta}
+    >
+      <Field
+        size="legacy"
+        required
+        label={editorUrlLabel}
+        containerClassName="mb-2"
+        helpText={editorUrlHelpText}
+        {...form.register("editorUrl", {
+          required: true,
+          onChange: () => {
+            if (!showAdvanced) {
+              form.setValue("urlPatterns.0.pattern", form.watch("editorUrl"));
+              form.setValue("urlPatterns.0.type", defaultType);
+              form.setValue("urlPatterns.0.include", true);
+            }
+          },
+        })}
+      />
+      {!forceAdvancedMode && (
+        <div className="my-3 text-xs">
+          <span
+            className="btn-link cursor-pointer"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+          >
+            <small>{showAdvanced ? "Hide" : "Show"} advanced options</small>
+          </span>
+        </div>
+      )}
+
+      <div
+        className="mt-4"
+        style={{ display: showAdvanced ? "block" : "none" }}
+      >
+        <label>URL Targeting</label>
+        {urlPatterns.fields.map((p, i) => (
+          <div key={i} className="mb-2">
+            <div className="row">
+              <div className="col-2">
+                <SelectField
+                  size="legacy"
+                  value={
+                    !form.watch(`urlPatterns.${i}.include`) ? "false" : "true"
+                  }
+                  options={[
+                    { label: "Include", value: "true" },
+                    { label: "Exclude", value: "false" },
+                  ]}
+                  onChange={(v) =>
+                    form.setValue(`urlPatterns.${i}.include`, v !== "false")
+                  }
+                />
+              </div>
+              <div className="col">
+                <Field
+                  size="legacy"
+                  {...form.register(`urlPatterns.${i}.pattern`)}
+                />
+              </div>
+              <div className="col-2">
+                <SelectField
+                  size="legacy"
+                  value={form.watch(`urlPatterns.${i}.type`)}
+                  options={[
+                    { label: "Simple", value: "simple" },
+                    { label: "Regex", value: "regex" },
+                  ]}
+                  sort={false}
+                  onChange={(v) => form.setValue(`urlPatterns.${i}.type`, v)}
+                />
+              </div>
+              <div className="col-auto" style={{ width: 30 }}>
+                {urlPatterns.fields.length > 1 && (
+                  <button
+                    type="button"
+                    className="close inline mt-1 p-1"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      urlPatterns.remove(i);
+                    }}
+                  >
+                    <span aria-hidden="true">×</span>
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="row">
+              <div className="col-2"></div>
+              <div className="col-7 px-3">
+                <div className="small text-muted">
+                  {form.watch(`urlPatterns.${i}.type`) === "simple" ? (
+                    <Tooltip
+                      body={
+                        <>
+                          Example Patterns:
+                          <ul className="px-4">
+                            <li>
+                              <code>https://www.example.com/pricing</code>
+                            </li>
+                            <li>
+                              <code>/sale?utm_source=email</code>
+                            </li>
+                            <li>
+                              <code>/items/*</code>
+                            </li>
+                          </ul>
+                        </>
+                      }
+                    >
+                      <strong>Simple</strong>: Matches a full URL or path.
+                      Supports <code>*</code> as a wildcard <FaInfoCircle />
+                    </Tooltip>
+                  ) : form.watch(`urlPatterns.${i}.type`) === "regex" ? (
+                    <Tooltip
+                      tipMinWidth={"500px"}
+                      body={
+                        <>
+                          <ul className="px-4">
+                            <li>
+                              <code style={{ whiteSpace: "nowrap" }}>
+                                https?:\/\/(www\.)?example\.com\/pricing\/?
+                              </code>{" "}
+                              will match both
+                              &quot;https://www.example.com/pricing&quot; and
+                              &quot;http://example.com/pricing/&quot;
+                            </li>
+                            <li>
+                              <code style={{ whiteSpace: "nowrap" }}>
+                                \/pricing\/?
+                              </code>{" "}
+                              will <em>also</em> match both
+                              &quot;https://www.example.com/pricing&quot; and
+                              &quot;http://example.com/pricing/&quot; (matching
+                              by path)
+                            </li>
+                          </ul>
+                        </>
+                      }
+                    >
+                      <strong>Regex</strong>: Matches a URL or path via regular
+                      expression <FaInfoCircle />
+                    </Tooltip>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        <button
+          className="btn btn-link mt-1"
+          onClick={(e) => {
+            e.preventDefault();
+            urlPatterns.append({
+              pattern: "",
+              type: defaultType,
+              include: true,
+            });
+          }}
+        >
+          <GBAddCircle className="mr-1" />
+          Add URL Target
+        </button>
+      </div>
+
+      {!patternsMatchUrl && (
+        <Callout status="warning">
+          Your URL patterns do not match the target URL
+        </Callout>
+      )}
+    </ModalStandard>
+  );
+};
+
+export default VisualChangesetModal;

@@ -1,0 +1,218 @@
+import React, { useState } from "react";
+import { CustomHookInterface } from "shared/validators";
+import { Flex } from "@radix-ui/themes";
+import Button from "@/ui/Button";
+import useApi from "@/hooks/useApi";
+import { useDefinitions } from "@/services/DefinitionsContext";
+import Callout from "@/ui/Callout";
+import LoadingOverlay from "@/components/LoadingOverlay";
+import EmptyState from "@/components/EmptyState";
+import { isCloud } from "@/services/env";
+import CustomHookModal from "@/components/CustomHooks/CustomHookModal";
+import CustomHooksTable from "@/components/CustomHooks/CustomHooksTable";
+import Link from "@/ui/Link";
+import SettingsPage from "@/components/Layout/SettingsPage";
+
+// Feature- and config-scoped hooks are managed from their entity's Validation
+// tab; here they are listed with a link to that entity plus history/revert.
+function EntityScopedHooksSection({
+  title,
+  description,
+  entityLabel,
+  entityHref,
+  hooks,
+  mutate,
+}: {
+  title: string;
+  description: string;
+  entityLabel: string;
+  entityHref: (hook: CustomHookInterface) => string;
+  hooks: CustomHookInterface[];
+  mutate: () => void;
+}) {
+  if (!hooks.length) return null;
+  return (
+    <div className="mt-5">
+      <h2>{title}</h2>
+      <p className="text-muted">{description}</p>
+      <CustomHooksTable
+        hooks={hooks}
+        column={{
+          header: entityLabel,
+          render: (hook) => (
+            <Link href={entityHref(hook)}>{hook.entityId}</Link>
+          ),
+        }}
+        canManage={() => false}
+        canRevert={() => true}
+        mutate={mutate}
+      />
+    </div>
+  );
+}
+
+export default function CustomHooksPage() {
+  const [modalData, setModalData] = useState<null | true | CustomHookInterface>(
+    null,
+  );
+
+  const { getProjectById } = useDefinitions();
+
+  const { data, error, mutate } = useApi<{
+    customHooks: CustomHookInterface[];
+    deletedProjects: string[];
+  }>("/custom-hooks");
+
+  if (isCloud()) {
+    return (
+      <Callout status="error">
+        Custom Hooks are not available on TestRing Cloud.
+      </Callout>
+    );
+  }
+
+  if (error) {
+    return <Callout status="error">Error: {error.message}</Callout>;
+  }
+  if (!data) {
+    return <LoadingOverlay />;
+  }
+
+  const allHooks = data.customHooks || [];
+  // Global/project hooks managed here; entity-scoped ones on the resource's Validation tab.
+  const hooks = allHooks.filter((h) => !h.entityType);
+  const featureHooks = allHooks.filter((h) => h.entityType === "feature");
+  const configHooks = allHooks.filter((h) => h.entityType === "config");
+  const experimentHooks = allHooks.filter((h) => h.entityType === "experiment");
+
+  const deletedProjects = new Set(data.deletedProjects);
+  const projectsLabel = (projects: string[]) => {
+    const labels: string[] = [];
+    // Definitions omit Projects the viewer can't read; show only a count
+    let restricted = 0;
+    for (const id of projects) {
+      const name = getProjectById(id)?.name;
+      if (name) labels.push(name);
+      else if (deletedProjects.has(id)) labels.push(`${id} (deleted)`);
+      else restricted++;
+    }
+    if (restricted) {
+      labels.push(
+        `${restricted} restricted Project${restricted === 1 ? "" : "s"}`,
+      );
+    }
+    return labels.join(", ");
+  };
+
+  return (
+    <SettingsPage
+      title="Custom Hooks"
+      description="Custom hooks allow you to extend the functionality of TestRing by writing custom javascript snippets that execute on certain events."
+      hideHeader={allHooks.length === 0}
+    >
+      {modalData && (
+        <CustomHookModal
+          current={modalData === true ? undefined : modalData}
+          close={() => setModalData(null)}
+          onSave={() => mutate()}
+        />
+      )}
+
+      {allHooks.length === 0 ? (
+        <EmptyState
+          description="Custom hooks allow you to extend the functionality of TestRing by
+        writing custom javascript snippets that execute on certain events."
+          title="Custom Hooks"
+          // TODO: add docs page and link to it here
+          leftButton={null}
+          rightButton={
+            <Button onClick={() => setModalData(true)}>Add custom hook</Button>
+          }
+        />
+      ) : (
+        <>
+          <div>
+            <Flex justify="between" align="center" mb="1">
+              <h2 className="mb-0">Global/Project Hooks</h2>
+              <Button onClick={() => setModalData(true)}>
+                Add Custom Hook
+              </Button>
+            </Flex>
+
+            <p className="text-muted">
+              These hooks run for all resources in your organization.
+            </p>
+
+            {hooks.length === 0 ? (
+              <Callout status="info">
+                No global or project-scoped hooks yet.
+              </Callout>
+            ) : (
+              <CustomHooksTable
+                hooks={hooks}
+                column={{
+                  header: "Projects",
+                  render: (hook) =>
+                    hook.projects.length ? (
+                      projectsLabel(hook.projects)
+                    ) : (
+                      <em>All Projects</em>
+                    ),
+                }}
+                canManage={() => true}
+                onEdit={setModalData}
+                mutate={mutate}
+              />
+            )}
+          </div>
+
+          <EntityScopedHooksSection
+            title="Feature-specific Hooks"
+            description="These hooks are scoped to a single feature and managed from that feature's Validation tab."
+            entityLabel="Feature"
+            entityHref={(hook) => `/features/${hook.entityId}#validation`}
+            hooks={featureHooks}
+            mutate={mutate}
+          />
+
+          <EntityScopedHooksSection
+            title="Config-specific Hooks"
+            description="These hooks are scoped to a single Config and managed from that Config's Validation tab."
+            entityLabel="Config"
+            entityHref={(hook) => `/configs/${hook.entityId}#validation`}
+            hooks={configHooks}
+            mutate={mutate}
+          />
+
+          {experimentHooks.length > 0 && (
+            <div className="mt-5">
+              <h2>Experiment-specific Hooks</h2>
+              <p className="text-muted">
+                These hooks are scoped to a single experiment. Experiment hooks
+                are now managed as global hooks above; you can remove any
+                leftover scoped hooks here.
+              </p>
+              <CustomHooksTable
+                hooks={experimentHooks}
+                column={{
+                  header: "Experiment",
+                  render: (hook) => (
+                    <Link href={`/experiment/${hook.entityId}`}>
+                      {hook.entityId}
+                    </Link>
+                  ),
+                }}
+                canManage={() => true}
+                // TODO: experiment-scoped hooks are cleanup-only until they
+                // are managed from the experiment page again; restore
+                // Enable/Disable (and Edit via onEdit) here when that lands.
+                canToggle={() => false}
+                mutate={mutate}
+              />
+            </div>
+          )}
+        </>
+      )}
+    </SettingsPage>
+  );
+}

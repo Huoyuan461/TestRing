@@ -1,0 +1,63 @@
+import { CLOUD_EGRESS_IP } from "shared/constants";
+import { isCloud } from "@/services/env";
+import Callout from "@/ui/Callout";
+
+export default function HostWarning({
+  host,
+  setHost,
+}: {
+  host?: string;
+  setHost: (host: string) => void;
+}) {
+  // Trying to connect to localhost
+  if (
+    host &&
+    host.match(/^([a-zA-Z0-9+.:-]+:\/\/)?(localhost|127.0.0.1)($|[/?:])/)
+  ) {
+    if (isCloud()) {
+      return (
+        <Callout status="error" mb="3">
+          TestRing Cloud cannot access your local computer with that hostname.
+          You must use a public ip address.
+        </Callout>
+      );
+    }
+
+    return (
+      <Callout status="error" mb="3">
+        TestRing runs inside Docker. To connect to localhost, you should use{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            setHost("host.docker.internal");
+          }}
+        >
+          host.docker.internal
+        </a>{" "}
+        (on Mac) or{" "}
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            setHost("172.17.0.1");
+          }}
+        >
+          172.17.0.1
+        </a>{" "}
+        (on Linux).
+      </Callout>
+    );
+  }
+
+  if (isCloud()) {
+    return (
+      <Callout status="info" mb="3">
+        If your database is behind a firewall, add TestRing Cloud&apos;s ip (
+        <code>{CLOUD_EGRESS_IP}</code>) to your allowlist.
+      </Callout>
+    );
+  }
+
+  return null;
+}

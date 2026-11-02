@@ -1,0 +1,10 @@
+@import "../../../styles/percent-suffix";
+
+.percentInputWrap {
+  @include percent-suffix;
+  display: inline-block;
+
+  span {
+    color: var(--color-text-low);
+  }
+}

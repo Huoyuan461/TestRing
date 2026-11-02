@@ -1,0 +1,610 @@
+import { format as sqlFormat } from "sql-formatter";
+import { SqlResultChunkInterface } from "../types/query";
+import {
+  FormatDialect,
+  GlobMatchFn,
+  SqlDialect,
+  SqlIdentifierQuote,
+  StringMatchFn,
+} from "../types/sql";
+import { FormatError } from "../types/error";
+import { parseEnvInt } from "./util/numbers";
+
+/** Escaping and LIKE-clause behavior for one dialect. Shared by the string-match
+ *  and glob-match builders so a dialect configures both from one place. */
+type LikeMatchOptions = {
+  escapeStringLiteral: (s: string) => string;
+  escapeWildcards?: (s: string) => string;
+  emitEscapeClause: boolean;
+};
+
+const defaultEscapeWildcards = (value: string) =>
+  value.replace(/([%_\\])/g, "\\$1");
+
+/**
+ * Creates a function that builds a string-match condition (LIKE or a warehouse-native equivalent).
+ *
+ * This is needed because in some dialects, _ and \ are treated as wildcard characters for LIKE,
+ * and we want to escape them correctly to we can match them literally.
+ */
+export function createLikeStringMatchFn({
+  escapeStringLiteral,
+  escapeWildcards = defaultEscapeWildcards,
+  emitEscapeClause,
+}: LikeMatchOptions): StringMatchFn {
+  return (columnExpr, operator, value) => {
+    const isPattern =
+      operator === "matches_pattern" || operator === "not_matches_pattern";
+    const pattern = escapeStringLiteral(
+      isPattern
+        ? globToLikePattern(value, escapeWildcards)
+        : escapeWildcards(value),
+    );
+    const escapeClause = emitEscapeClause
+      ? ` ESCAPE '${escapeStringLiteral("\\")}'`
+      : "";
+    switch (operator) {
+      case "matches_pattern":
+        return `${columnExpr} LIKE '${pattern}'${escapeClause}`;
+      case "not_matches_pattern":
+        return `${columnExpr} NOT LIKE '${pattern}'${escapeClause}`;
+      case "starts_with":
+        return `${columnExpr} LIKE '${pattern}%'${escapeClause}`;
+      case "ends_with":
+        return `${columnExpr} LIKE '%${pattern}'${escapeClause}`;
+      case "contains":
+        return `${columnExpr} LIKE '%${pattern}%'${escapeClause}`;
+      case "not_contains":
+        return `${columnExpr} NOT LIKE '%${pattern}%'${escapeClause}`;
+    }
+  };
+}
+
+/**
+ * Translates a user-facing wildcard pattern into a LIKE pattern. `*` matches any
+ * run of characters and `?` matches exactly one; everything else is literal.
+ *
+ * LIKE's own metacharacters are escaped in the literal chunks *before* the
+ * wildcards are substituted, so a pattern like `/reports/50%_*` matches a
+ * literal "50%_" followed by anything, rather than treating the `%` and `_` as
+ * wildcards of their own.
+ */
+export function globToLikePattern(
+  glob: string,
+  escapeWildcards: (s: string) => string = defaultEscapeWildcards,
+): string {
+  return glob
+    .split(/([*?])/)
+    .map((chunk) => {
+      if (chunk === "*") return "%";
+      if (chunk === "?") return "_";
+      return escapeWildcards(chunk);
+    })
+    .join("");
+}
+
+/**
+ * Creates a function that matches a column against a user-facing wildcard
+ * pattern (`*` any run, `?` one character).
+ */
+export function createGlobMatchFn({
+  escapeStringLiteral,
+  escapeWildcards = defaultEscapeWildcards,
+  emitEscapeClause,
+}: LikeMatchOptions): GlobMatchFn {
+  return (columnExpr, glob) => {
+    const pattern = escapeStringLiteral(
+      globToLikePattern(glob, escapeWildcards),
+    );
+    const escapeClause = emitEscapeClause
+      ? ` ESCAPE '${escapeStringLiteral("\\")}'`
+      : "";
+    return `${columnExpr} LIKE '${pattern}'${escapeClause}`;
+  };
+}
+
+/** Both LIKE matchers from one options object so escaping cannot drift. */
+export function createLikeMatchFns(options: LikeMatchOptions): {
+  stringMatch: StringMatchFn;
+  globMatch: GlobMatchFn;
+} {
+  return {
+    stringMatch: createLikeStringMatchFn(options),
+    globMatch: createGlobMatchFn(options),
+  };
+}
+
+// Wraps a SQL identifier (column, alias) in the dialect's quote character,
+// escaping any embedded quotes by doubling them (ANSI SQL convention).
+export function quoteIdentifier(name: string, q: SqlIdentifierQuote): string {
+  return `${q}${name.replace(new RegExp(q, "g"), q + q)}${q}`;
+}
+
+export const SQL_ROW_LIMIT = 1000;
+export const ASK_ROW_LIMIT = 500;
+
+export const MAX_SQL_LENGTH_TO_FORMAT = parseEnvInt(
+  process.env.MAX_SQL_LENGTH_TO_FORMAT,
+  15_000,
+  { min: 1, name: "MAX_SQL_LENGTH_TO_FORMAT" },
+);
+
+export function format(
+  sql: string,
+  dialect?: FormatDialect,
+  onError?: (error: FormatError) => void,
+): string {
+  // sqlFormat is slow, consuming a lot of CPU and blocking other operations.
+  // To avoid performance issues, skip formatting for very large queries.
+  if (MAX_SQL_LENGTH_TO_FORMAT && sql.length > MAX_SQL_LENGTH_TO_FORMAT) {
+    return sql;
+  }
+  if (!dialect) return sql;
+
+  try {
+    return sqlFormat(sql, {
+      language: dialect,
+    });
+  } catch (e) {
+    const error = e instanceof Error ? e : new Error(String(e));
+    if (onError) {
+      onError({ error, originalSql: sql });
+    }
+    return sql;
+  }
+}
+
+/**
+ * Drop a terminating semicolon even when a trailing comment follows it, e.g.
+ * `SELECT 1;\n-- note`. `/;\s*$/` misses that case and the leftover `;` then
+ * fails multi-statement checks after the query is wrapped in a subquery.
+ *
+ * Implemented as a single linear scan rather than a regex: the equivalent
+ * `/;(\s|--[^\n]*|\/\*[\s\S]*?\*\/)*$/` backtracks exponentially on input
+ * like `";" + "/**\/".repeat(n) + "x"`, and this runs on user-supplied SQL.
+ *
+ * Everything from the last `;` that is followed only by whitespace, `--` line
+ * comments and terminated block comments is removed.
+ */
+export function stripTrailingSemicolon(sql: string): string {
+  // Index of the most recent `;` that has only trivia after it so far.
+  let cut = -1;
+  // Once a `/*` has no closing `*/` anywhere after it, no later one can either.
+  let noMoreBlockCommentEnds = false;
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === ";") {
+      cut = i;
+      i++;
+    } else if (cut === -1) {
+      // Not (yet) in a trailing run, so nothing here can be trivia.
+      i++;
+    } else if (/\s/.test(ch)) {
+      i++;
+    } else if (ch === "-" && sql[i + 1] === "-") {
+      const newline = sql.indexOf("\n", i + 2);
+      i = newline === -1 ? sql.length : newline + 1;
+    } else if (ch === "/" && sql[i + 1] === "*" && !noMoreBlockCommentEnds) {
+      const end = sql.indexOf("*/", i + 2);
+      if (end === -1) {
+        // Unterminated comment: the run is broken, but a later `;` inside the
+        // comment text can still start a new one.
+        noMoreBlockCommentEnds = true;
+        cut = -1;
+        i++;
+      } else {
+        i = end + 2;
+      }
+    } else {
+      cut = -1;
+      i++;
+    }
+  }
+  return (cut === -1 ? sql : sql.slice(0, cut)).trim();
+}
+
+// Any template variable built on startDate, e.g. {{startDate}} or
+// {{date startDateISO "yyyyMMdd"}}. Without one, every query scans the whole table.
+export function hasStartDateFilter(sql: string): boolean {
+  return /\{\{[^}]*startDate/.test(sql);
+}
+
+export function ensureLimit(sql: string, limit: number): string {
+  if (limit <= 0) throw new Error("Limit must be a positive integer");
+
+  sql = stripTrailingSemicolon(sql);
+
+  // Case 1: Has both LIMIT and OFFSET clauses
+  const limitOffsetMatch = sql.match(/LIMIT\s+(\d+)\s+OFFSET\s+(\d+)$/i);
+  if (limitOffsetMatch) {
+    const currentLimit = parseInt(limitOffsetMatch[1], 10);
+    if (!isNaN(currentLimit) && currentLimit <= limit) {
+      return sql;
+    }
+    return sql.replace(
+      /LIMIT\s+\d+\s+OFFSET\s+(\d+)$/i,
+      `LIMIT ${limit} OFFSET $1`,
+    );
+  }
+  // Case 2: Has OFFSET clause only (BigQuery is the only one that supports this)
+  if (/OFFSET\s+\d+$/i.test(sql)) {
+    return sql.replace(/OFFSET\s+(\d+)$/i, `LIMIT ${limit} OFFSET $1`);
+  }
+  // Case 3: LIMIT clause only, but with 2 numbers (MySQL only)
+  const limitTwoNumbersMatch = sql.match(/LIMIT\s+(\d+)\s*,\s*(\d+)$/i);
+  if (limitTwoNumbersMatch) {
+    const currentLimit = parseInt(limitTwoNumbersMatch[2], 10);
+    if (!isNaN(currentLimit) && currentLimit <= limit) {
+      return sql;
+    }
+    return sql.replace(/LIMIT\s+(\d+)\s*,\s*\d+$/i, `LIMIT $1, ${limit}`);
+  }
+  // Case 4: Normal LIMIT clause only
+  const limitMatch = sql.match(/LIMIT\s+(\d+)$/i);
+  if (limitMatch) {
+    const currentLimit = parseInt(limitMatch[1], 10);
+    if (!isNaN(currentLimit) && currentLimit <= limit) {
+      return sql;
+    }
+
+    return sql.replace(/LIMIT\s+\d+$/i, `LIMIT ${limit}`);
+  }
+  // Default: Append LIMIT at the end
+  // Add a newline in case there's a line comment at the end
+  return `${sql}\nLIMIT ${limit}`;
+}
+
+export function isReadOnlySQL(sql: string) {
+  const { strippedSql } = stripCommentsAndStrings(sql, true);
+
+  // Check the first keyword (e.g. "select", "with", etc.)
+  return !!strippedSql.match(/^\s*(with|select|explain|show|describe|desc)\b/i);
+}
+
+const MAX_AGENT_SQL_LENGTH = 100_000;
+
+const DML_DDL_DENY_LIST =
+  /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|MERGE|GRANT|REVOKE|CALL|EXEC|EXECUTE)\b/i;
+
+const DIALECT_ESCAPE_HATCHES =
+  /\b(INTO\s+OUTFILE|INTO\s+DUMPFILE|COPY\s+.{1,200}\s+TO|pg_read_file|pg_read_binary_file|LOAD_FILE|EXECUTE\s+IMMEDIATE)\b|(?<!\w)(file|url|s3)\s*\(/i;
+
+/**
+ * Stricter read-only SQL guard for agent-generated queries. Unlike
+ * `isReadOnlySQL` (first-keyword only), this scans the entire stripped
+ * statement for DML/DDL keywords, multi-statement boundaries, and
+ * dialect-specific escape hatches. Throws on violation.
+ */
+export function assertSafeReadOnlySQL(sql: string): void {
+  if (sql.length > MAX_AGENT_SQL_LENGTH) {
+    throw new Error(
+      `Query exceeds the ${MAX_AGENT_SQL_LENGTH}-character safety limit`,
+    );
+  }
+
+  const { strippedSql, parseError } = stripCommentsAndStrings(sql, true);
+
+  if (parseError) {
+    throw new Error(
+      "Query has unterminated string or comment — cannot verify safety",
+    );
+  }
+
+  // First keyword must be SELECT or WITH
+  if (!/^\s*(SELECT|WITH)\b/i.test(strippedSql)) {
+    throw new Error("Only SELECT and WITH queries are allowed");
+  }
+
+  // Single statement only
+  if (strippedSql.includes(";")) {
+    throw new Error("Multi-statement queries are not allowed");
+  }
+
+  // Dialect-specific escape hatches (checked before generic SELECT INTO)
+  const escapeMatch = strippedSql.match(DIALECT_ESCAPE_HATCHES);
+  if (escapeMatch) {
+    throw new Error(`Disallowed expression: ${escapeMatch[0].trim()}`);
+  }
+
+  // SELECT INTO (but not INTO OUTFILE/DUMPFILE — caught above)
+  if (/\bSELECT\s+.*\bINTO\b/i.test(strippedSql)) {
+    throw new Error("SELECT INTO is not allowed");
+  }
+
+  // DML/DDL deny-list anywhere in the stripped SQL
+  const dmlMatch = strippedSql.match(DML_DDL_DENY_LIST);
+  if (dmlMatch) {
+    throw new Error(`Disallowed keyword: ${dmlMatch[0].toUpperCase()}`);
+  }
+}
+
+export function usesBackslashStringEscapes(
+  dialect: Pick<SqlDialect, "escapeStringLiteral">,
+): boolean {
+  return dialect.escapeStringLiteral("\\") !== "\\";
+}
+
+export function isMultiStatementSQL(sql: string, backslashEscapes: boolean) {
+  const { strippedSql, parseError } = stripCommentsAndStrings(
+    sql,
+    backslashEscapes,
+  );
+  if (parseError) {
+    // Parse failed, so string boundaries are unknown. Stay conservative and
+    // treat any non-trailing semicolon as a statement separator.
+    return stripTrailingSemicolon(sql).includes(";");
+  }
+  // Otherwise, search the stripped SQL for semicolons
+  else {
+    return strippedSql.includes(";");
+  }
+}
+
+function stripCommentsAndStrings(
+  sql: string,
+  backslashEscapes: boolean,
+): {
+  strippedSql: string;
+  parseError: boolean;
+} {
+  let state:
+    | "singleQuote"
+    | "doubleQuote"
+    | "backtickQuote"
+    | "lineComment"
+    | "blockComment"
+    | null = null;
+
+  const n = sql.length;
+
+  let strippedSql = "";
+
+  for (let i = 0; i < n; i++) {
+    const char = sql[i];
+    const nextChar = i + 1 < n ? sql[i + 1] : null;
+
+    if (state === "singleQuote") {
+      if (backslashEscapes && char === "\\") {
+        // Skip escaped character (e.g. \' or \\)
+        i++;
+      } else if (char === "'") {
+        strippedSql += char;
+        state = null;
+      }
+    } else if (state === "doubleQuote") {
+      if (backslashEscapes && char === "\\") {
+        // Skip escaped character (e.g. \" or \\)
+        i++;
+      } else if (char === '"') {
+        strippedSql += char;
+        state = null;
+      }
+    } else if (state === "backtickQuote") {
+      if (char === "`") {
+        strippedSql += char;
+        state = null;
+      }
+    } else if (state === "lineComment") {
+      if (char === "\n" || char === "\r") {
+        state = null; // End of line comment
+      }
+    } else if (state === "blockComment") {
+      if (char === "*" && nextChar === "/") {
+        state = null; // End of block comment
+        i++; // Skip the '/'
+      }
+    } else {
+      // Not in any special state
+      if (char === "'") {
+        strippedSql += char;
+        state = "singleQuote";
+      } else if (char === '"') {
+        strippedSql += char;
+        state = "doubleQuote";
+      } else if (char === "`") {
+        strippedSql += char;
+        state = "backtickQuote";
+      } else if (char === "-" && nextChar === "-") {
+        state = "lineComment";
+        i++; // Skip the second '-'
+      } else if (char === "/" && nextChar === "*") {
+        state = "blockComment";
+        i++; // Skip the '*'
+      } else {
+        strippedSql += char;
+      }
+    }
+  }
+
+  // Removing trailing semicolon and spaces
+  strippedSql = strippedSql.replace(/;\s*$/, "").trim();
+
+  // See if we ended in an invalid state
+  let parseError = false;
+  if (
+    state === "singleQuote" ||
+    state === "doubleQuote" ||
+    state === "backtickQuote" ||
+    state === "blockComment"
+  ) {
+    parseError = true;
+  }
+
+  return {
+    strippedSql,
+    parseError,
+  };
+}
+
+type SqlResultChunkData = Pick<SqlResultChunkInterface, "numRows" | "data">;
+
+export function encodeSQLResults(
+  // Raw SQL results
+  results: Record<string, unknown>[],
+  // 4MB default chunk size (document max is 16MB, but leave plenty of room for overhead)
+  chunkSizeBytes: number = 4_000_000,
+): SqlResultChunkData[] {
+  if (results.length === 0) {
+    return [];
+  }
+
+  const columns = Array.from(
+    results.reduce((acc, row) => {
+      Object.keys(row).forEach((column) => acc.add(column));
+      return acc;
+    }, new Set<string>()),
+  );
+  const encodedResults: SqlResultChunkData[] = [];
+
+  function createChunk(): SqlResultChunkData {
+    const chunk: SqlResultChunkData = {
+      numRows: 0,
+      data: {},
+    };
+    columns.forEach((col) => {
+      chunk.data[col] = [];
+    });
+    return chunk;
+  }
+
+  function getSize(value: unknown): number {
+    if (value === null || value === undefined) return 1;
+    if (typeof value === "boolean") return 1;
+    if (typeof value === "number") return 8;
+    if (typeof value === "string") return value.length + 5;
+
+    // Each nested field has overhead, so just multiply by 2 to be extra conservative
+    return 1 + JSON.stringify(value).length * 2;
+  }
+
+  let currentChunk = createChunk();
+  let currentChunkSize = 0;
+
+  for (const row of results) {
+    currentChunk.numRows++;
+    for (const col of columns) {
+      const value = row[col] ?? null;
+      currentChunk.data[col].push(value);
+      currentChunkSize += getSize(value);
+    }
+
+    if (currentChunkSize >= chunkSizeBytes) {
+      encodedResults.push(currentChunk);
+      // Start a new chunk
+      currentChunk = createChunk();
+      currentChunkSize = 0;
+    }
+  }
+  // Push the final chunk if it has any data
+  if (currentChunkSize > 0) {
+    encodedResults.push(currentChunk);
+  }
+
+  return encodedResults;
+}
+
+/**
+ * Given metric filter groups where each group's conditions are ANDed together,
+ * produces a minimal OR clause by removing groups that are subsumed by less
+ * restrictive groups.
+ *
+ * Group X is subsumed by group Y if Y's conditions are a subset of X's
+ * conditions — Y is less restrictive and matches all rows X matches (plus more).
+ *
+ * @param filterGroups - Each inner array contains SQL condition strings for one
+ *   metric (ANDed together). Null values are ignored (treated as no-op filters).
+ * @returns Minimal SQL condition string, or empty string if no filtering needed.
+ *
+ * @example
+ * // Metric 1: color='blue' AND shape='circle'
+ * // Metric 2: color='blue'
+ * buildMinimalOrCondition([
+ *   ["color='blue'", "shape='circle'"],
+ *   ["color='blue'"]
+ * ])
+ * // Returns: "color='blue'"  (metric 1 is subsumed by metric 2)
+ */
+export function buildMinimalOrCondition(
+  filterGroups: (string | null)[][],
+): string {
+  // Remove null filters and deduplicate within each group
+  const cleanGroups = filterGroups.map((group) => [
+    ...new Set(group.filter((f): f is string => f !== null)),
+  ]);
+
+  // An empty group (no conditions) matches everything
+  // So we cannot filter anything out
+  if (cleanGroups.length === 0 || cleanGroups.some((g) => g.length === 0)) {
+    return "";
+  }
+
+  // Remove groups dominated by less restrictive groups.
+  // Group i is dominated if another group j's conditions are a subset of i's
+  // (j is less restrictive, so i is redundant in the OR).
+  const groupSets = cleanGroups.map((g) => new Set(g));
+  const dominated = new Set<number>();
+
+  for (let i = 0; i < groupSets.length; i++) {
+    if (dominated.has(i)) continue;
+    for (let j = i + 1; j < groupSets.length; j++) {
+      if (dominated.has(j)) continue;
+
+      const iSubJ = isSubsetOf(groupSets[i], groupSets[j]);
+      const jSubI = isSubsetOf(groupSets[j], groupSets[i]);
+
+      if (iSubJ && jSubI) {
+        // Equal sets — deduplicate, keep i
+        dominated.add(j);
+      } else if (iSubJ) {
+        // i ⊆ j — i is less restrictive, j is dominated
+        dominated.add(j);
+      } else if (jSubI) {
+        // j ⊆ i — j is less restrictive, i is dominated
+        dominated.add(i);
+        break;
+      }
+    }
+  }
+
+  const clauses: string[] = [];
+  for (let i = 0; i < cleanGroups.length; i++) {
+    if (dominated.has(i)) continue;
+    const parts = cleanGroups[i];
+    clauses.push(parts.length === 1 ? parts[0] : `(${parts.join(" AND ")})`);
+  }
+
+  if (clauses.length === 0) return "";
+  if (clauses.length === 1) return clauses[0];
+  return `(${clauses.join("\nOR\n")})`;
+}
+
+function isSubsetOf(a: Set<string>, b: Set<string>): boolean {
+  if (a.size > b.size) return false;
+  for (const item of a) {
+    if (!b.has(item)) return false;
+  }
+  return true;
+}
+
+export function decodeSQLResults(
+  chunks: SqlResultChunkData[],
+): Record<string, unknown>[] {
+  const results: Record<string, unknown>[] = [];
+
+  for (const chunk of chunks) {
+    const { data, numRows } = chunk;
+    if (!numRows) continue;
+
+    const columns = Object.keys(data);
+    for (let i = 0; i < numRows; i++) {
+      const row: Record<string, unknown> = {};
+      for (const col of columns) {
+        row[col] = data[col]?.[i] ?? null;
+      }
+      results.push(row);
+    }
+  }
+
+  return results;
+}

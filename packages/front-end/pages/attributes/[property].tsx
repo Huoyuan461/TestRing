@@ -1,0 +1,342 @@
+import React, { useMemo, useState } from "react";
+import { useRouter } from "next/router";
+import { Box, Flex, IconButton } from "@radix-ui/themes";
+import { BsThreeDotsVertical } from "react-icons/bs";
+import { FaQuestionCircle } from "react-icons/fa";
+import ReferencesLink from "@/components/References/ReferencesLink";
+import Heading from "@/ui/Heading";
+import Text from "@/ui/Text";
+import Link from "@/ui/Link";
+import PageHead from "@/components/Layout/PageHead";
+import { useAttributeSchema } from "@/services/features";
+import { useAuth } from "@/services/auth";
+import { useAttributeReferences } from "@/hooks/useAttributeReferences";
+import { useUser } from "@/services/UserContext";
+import usePermissionsUtil from "@/hooks/usePermissionsUtils";
+import AttributeModal from "@/components/Features/AttributeModal";
+import ProjectBadges from "@/components/ProjectBadges";
+import Modal from "@/components/Modal";
+import Callout from "@/ui/Callout";
+import Frame from "@/ui/Frame";
+import DataList from "@/ui/DataList";
+import { useCustomFields } from "@/hooks/useCustomFields";
+import { filterCustomFieldsForSectionAndProjects } from "@/services/customFields";
+import { customFieldDataListItems } from "@/components/CustomFields/renderCustomFieldValue";
+import MarkdownInlineEdit from "@/components/Markdown/MarkdownInlineEdit";
+import SortedTags from "@/components/Tags/SortedTags";
+import {
+  DropdownMenu,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/ui/DropdownMenu";
+import AttributeReferencesList from "@/components/Features/AttributeReferencesList";
+import Tooltip from "@/components/Tooltip/Tooltip";
+
+export default function AttributeDetailPage() {
+  const router = useRouter();
+  const property = router.query.property as string | undefined;
+  const attributeSchema = useAttributeSchema(true);
+  const attribute = useMemo(
+    () => attributeSchema.find((a) => a.property === property),
+    [attributeSchema, property],
+  );
+
+  const {
+    references,
+    loading: referencesLoading,
+    error: referencesError,
+  } = useAttributeReferences(property ? [property] : []);
+  const { apiCall } = useAuth();
+  const { refreshOrganization, hasCommercialFeature } = useUser();
+  const allCustomFields = useCustomFields();
+  const attributeCustomFields = useMemo(
+    () =>
+      hasCommercialFeature("custom-metadata")
+        ? (filterCustomFieldsForSectionAndProjects(
+            allCustomFields,
+            "attribute",
+            attribute?.projects,
+          ) ?? [])
+        : [],
+    [allCustomFields, hasCommercialFeature, attribute?.projects],
+  );
+  const permissionsUtil = usePermissionsUtil();
+
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [showReferencesModal, setShowReferencesModal] = useState(false);
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+
+  const attributeReferences = property ? references?.[property] : undefined;
+  const referencingFeatures = attributeReferences?.features ?? [];
+  const referencingExperiments = attributeReferences?.experiments ?? [];
+  const referencingSavedGroups = attributeReferences?.savedGroups ?? [];
+
+  const totalReferences =
+    referencingFeatures.length +
+    referencingExperiments.length +
+    referencingSavedGroups.length;
+
+  if (property === undefined) {
+    return null; // Still loading router
+  }
+
+  if (!attribute) {
+    return (
+      <>
+        <PageHead
+          breadcrumb={[
+            { display: "Attributes", href: "/attributes" },
+            { display: property },
+          ]}
+        />
+        <div className="p-3 container-fluid pagecontents">
+          <Callout status="error">
+            Attribute &quot;{property}&quot; not found. It may have been deleted
+            or you may not have access.{" "}
+            <Link href="/attributes">Back to Attributes</Link>
+          </Callout>
+        </div>
+      </>
+    );
+  }
+
+  const canEdit = permissionsUtil.canCreateAttribute(attribute);
+
+  return (
+    <>
+      {showReferencesModal && (
+        <Modal
+          open={true}
+          header={`References: ${attribute.property}`}
+          close={() => setShowReferencesModal(false)}
+          closeCta="Close"
+          trackingEventModalType="show-attribute-references"
+        >
+          <AttributeReferencesList
+            features={referencingFeatures}
+            experiments={referencingExperiments}
+            conditionGroups={referencingSavedGroups}
+          />
+        </Modal>
+      )}
+      {showEditModal && (
+        <AttributeModal
+          close={() => {
+            setShowEditModal(false);
+            refreshOrganization();
+          }}
+          attribute={attribute.property}
+        />
+      )}
+      {showDeleteModal && (
+        <Modal
+          open={true}
+          header="Delete Attribute"
+          close={() => setShowDeleteModal(false)}
+          cta="Delete"
+          submitColor="danger"
+          trackingEventModalType=""
+          submit={async () => {
+            const response = await apiCall<{
+              status: number;
+              eventForwarderWarning?: string;
+            }>("/attribute/", {
+              method: "DELETE",
+              body: JSON.stringify({ id: attribute.property }),
+            });
+            refreshOrganization();
+            setShowDeleteModal(false);
+            if (response.eventForwarderWarning) {
+              sessionStorage.setItem(
+                "attributeDeleteEventForwarderWarning",
+                response.eventForwarderWarning,
+              );
+            }
+            router.push("/attributes");
+          }}
+        >
+          <p>
+            Are you sure you want to delete the{" "}
+            {attribute.hashAttribute ? "identifier " : ""}
+            {attribute.datatype} attribute:{" "}
+            <code className="font-weight-bold">{attribute.property}</code>?
+          </p>
+          <p>This action cannot be undone.</p>
+        </Modal>
+      )}
+      <PageHead
+        breadcrumb={[
+          { display: "Attributes", href: "/attributes" },
+          { display: attribute.property },
+        ]}
+      />
+      <div className="p-3 container-fluid pagecontents">
+        <Flex align="center" justify="between" mb="4">
+          <Heading as="h1" size="xl" overflowWrap="anywhere">
+            {attribute.property}
+          </Heading>
+          {canEdit && (
+            <DropdownMenu
+              trigger={
+                <IconButton
+                  variant="ghost"
+                  color="gray"
+                  radius="full"
+                  size="3"
+                  highContrast
+                >
+                  <BsThreeDotsVertical size={18} />
+                </IconButton>
+              }
+              open={dropdownOpen}
+              onOpenChange={setDropdownOpen}
+              menuPlacement="end"
+            >
+              <DropdownMenuGroup>
+                <DropdownMenuItem
+                  onClick={() => {
+                    setShowEditModal(true);
+                    setDropdownOpen(false);
+                  }}
+                >
+                  Edit Information
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem
+                  color="red"
+                  onClick={() => {
+                    setShowDeleteModal(true);
+                    setDropdownOpen(false);
+                  }}
+                >
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenu>
+          )}
+        </Flex>
+
+        <Flex align="center" gap="4" mb="4" wrap="wrap" justify="between">
+          <Flex align="center" gap="4" wrap="wrap">
+            <Text>
+              Data type: <strong>{attribute.datatype}</strong>
+              {attribute.datatype === "enum" && attribute.enum && (
+                <> ({attribute.enum})</>
+              )}
+            </Text>
+            {attribute.format && (
+              <Text>
+                Format: <strong>{attribute.format}</strong>
+              </Text>
+            )}
+            {(attribute.projects?.length ?? 0) > 0 && (
+              <Flex align="center" gap="2">
+                <Text>Projects:</Text>
+                <ProjectBadges
+                  projectIds={attribute.projects ?? []}
+                  resourceType="attribute"
+                />
+              </Flex>
+            )}
+            {(attribute.tags?.length ?? 0) > 0 && (
+              <Flex align="center" gap="2">
+                <Text>Tags:</Text>
+                <SortedTags tags={attribute.tags ?? []} useFlex={true} />
+              </Flex>
+            )}
+            <Text>
+              Identifier:{" "}
+              <strong>{attribute.hashAttribute ? "Yes" : "No"}</strong>
+              {attribute.hashAttribute && (
+                <Tooltip body="Any attribute that uniquely identifies a user, account, device, or similar.">
+                  <FaQuestionCircle
+                    className="ml-1"
+                    style={{ position: "relative", top: "-1px" }}
+                  />
+                </Tooltip>
+              )}
+            </Text>
+          </Flex>
+          <Flex direction="column" align="end" gap="2">
+            <ReferencesLink
+              total={totalReferences}
+              onShow={() => setShowReferencesModal(true)}
+              emptyTooltip="No features, experiments, or saved groups currently reference this attribute."
+              status={
+                referencesError
+                  ? "error"
+                  : referencesLoading
+                    ? "loading"
+                    : undefined
+              }
+            />
+          </Flex>
+        </Flex>
+
+        {attribute.archived && (
+          <Callout status="info" mb="4">
+            <strong>This attribute is archived.</strong> It will not be
+            available when creating or editing targeting rules.
+          </Callout>
+        )}
+
+        <Box mb="4">
+          <Frame>
+            <div className="mh-350px" style={{ overflowY: "auto" }}>
+              <MarkdownInlineEdit
+                value={attribute.description || ""}
+                save={async (description) => {
+                  const payload = { ...attribute, description };
+                  // Backend expects specific types or omitted, not null
+                  if (payload.archived === null) delete payload.archived;
+                  if (payload.hashAttribute === null)
+                    delete payload.hashAttribute;
+                  if (payload.tags === null) delete payload.tags;
+                  if (payload.projects === null) delete payload.projects;
+                  if (payload.format === null) delete payload.format;
+                  if (payload.enum === null) delete payload.enum;
+                  if (payload.disableEqualityConditions === null)
+                    delete payload.disableEqualityConditions;
+                  if (payload.customFields === null)
+                    delete payload.customFields;
+                  await apiCall("/attribute", {
+                    method: "PUT",
+                    body: JSON.stringify(payload),
+                  });
+                  await refreshOrganization();
+                }}
+                canCreate={canEdit}
+                canEdit={canEdit}
+                label="description"
+                header="Description"
+                headerClassName="h4"
+                containerClassName="mb-1"
+              />
+            </div>
+          </Frame>
+        </Box>
+
+        {attributeCustomFields.length > 0 && (
+          <Box mb="4">
+            <Frame>
+              <Heading as="h4" size="sm" mb="3">
+                Additional Fields
+              </Heading>
+              <DataList
+                data={customFieldDataListItems(
+                  attributeCustomFields,
+                  attribute.customFields,
+                )}
+                maxColumns={3}
+              />
+            </Frame>
+          </Box>
+        )}
+      </div>
+    </>
+  );
+}

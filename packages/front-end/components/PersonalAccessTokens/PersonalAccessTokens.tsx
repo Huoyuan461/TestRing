@@ -1,0 +1,215 @@
+import React, { FC, useCallback, useMemo, useState } from "react";
+import { ApiKeyInterface, SecretApiKey } from "shared/types/apikey";
+import Link from "@/ui/Link";
+import { ApiKeysTable } from "@/components/ApiKeysTable/ApiKeysTable";
+import { RotatedApiKey } from "@/components/ApiKeysTable/RotateApiKeyModal";
+import ApiKeysModal from "@/components/Settings/ApiKeysModal";
+import { useAuth } from "@/services/auth";
+import { groupApiKeysByType } from "@/services/secret-api-keys.utils";
+import useApi from "@/hooks/useApi";
+import Button from "@/ui/Button";
+import Callout from "@/ui/Callout";
+import { useUser } from "@/services/UserContext";
+import usePermissionsUtil from "@/hooks/usePermissionsUtils";
+
+type PersonalAccessTokensProps = {
+  accessTokens: ApiKeyInterface[];
+  onDelete: (keyId: string | undefined) => () => Promise<void>;
+  onReveal: (keyId: string | undefined) => () => Promise<string>;
+  onToggleDisabled: (
+    keyId: string | undefined,
+    disabled: boolean,
+  ) => () => Promise<void>;
+  onCreate: () => void;
+  onRotate: (keyId: string, gracePeriodHours: number) => Promise<RotatedApiKey>;
+  onRevokePrevious: (keyId: string) => Promise<void>;
+};
+
+export const PersonalAccessTokens: FC<PersonalAccessTokensProps> = ({
+  accessTokens,
+  onDelete,
+  onReveal,
+  onToggleDisabled,
+  onCreate,
+  onRotate,
+  onRevokePrevious,
+}) => {
+  const [open, setOpen] = useState(false);
+  const [editingKey, setEditingKey] = useState<ApiKeyInterface | null>(null);
+  const [copyFrom, setCopyFrom] = useState<ApiKeyInterface | null>(null);
+  const { settings } = useUser();
+  const tokensDisabled = !!settings?.disablePersonalAccessTokens;
+  const permissionsUtils = usePermissionsUtil();
+  // Each settings page has its own gate, so link only where the member can go.
+  const canManageApiKeys = permissionsUtils.canViewApiKeys();
+  const canManageTokens =
+    permissionsUtils.canManagePersonalAccessTokens() ||
+    permissionsUtils.canManageOrgSettings();
+
+  return (
+    <div>
+      {(open || copyFrom) && (
+        <ApiKeysModal
+          close={() => {
+            setOpen(false);
+            setCopyFrom(null);
+          }}
+          onCreate={onCreate}
+          personalAccessToken
+          copyFrom={copyFrom ?? undefined}
+          onDeleteCopySource={copyFrom ? onDelete(copyFrom.id) : undefined}
+        />
+      )}
+
+      {editingKey && (
+        <ApiKeysModal
+          close={() => setEditingKey(null)}
+          onCreate={() => {
+            setEditingKey(null);
+            onCreate();
+          }}
+          personalAccessToken
+          existingKey={editingKey}
+        />
+      )}
+
+      <div className="mb-4">
+        <h1>Personal Access Tokens</h1>
+        <p className="text-gray">
+          Personal Access Tokens can do everything you can, unless you limit
+          their permissions. Because of this, they must be kept secure and{" "}
+          <strong>must not be exposed to others</strong>.
+        </p>
+        {accessTokens.length > 0 && (
+          <ApiKeysTable
+            onDelete={onDelete}
+            keys={accessTokens}
+            canDeleteKeys
+            onReveal={onReveal}
+            onToggleDisabled={onToggleDisabled}
+            onEdit={(key) => setEditingKey(key)}
+            onCopy={tokensDisabled ? undefined : setCopyFrom}
+            onRotate={tokensDisabled ? undefined : onRotate}
+            onRevokePrevious={onRevokePrevious}
+          />
+        )}
+        {tokensDisabled ? (
+          <Callout status="warning">
+            Personal access tokens are disabled for your organization. Existing
+            tokens no longer work and new ones can&apos;t be created. Contact an
+            admin if you need API access.
+          </Callout>
+        ) : (
+          <Button onClick={() => setOpen(true)}>
+            New personal access token
+          </Button>
+        )}
+      </div>
+
+      {canManageTokens && (
+        <div className="mb-5">
+          <Callout status="info">
+            {canManageApiKeys ? (
+              <>
+                Administrators can create userless keys for an organization on
+                the <Link href="/settings/keys">API Keys</Link> page, and review
+                or disable
+              </>
+            ) : (
+              <>Administrators can review or disable</>
+            )}{" "}
+            members&apos; tokens under{" "}
+            <Link href="/settings/personal-access-tokens">Manage PATs</Link>.
+          </Callout>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const PersonalAccessTokensContainer = () => {
+  const { apiCall } = useAuth();
+  const { data, mutate } = useApi<{ keys: ApiKeyInterface[] }>("/keys");
+
+  const userKeys = useMemo(() => {
+    if (!data?.keys) return [];
+    return groupApiKeysByType(data.keys).user;
+  }, [data?.keys]);
+
+  const onReveal = useCallback(
+    (keyId: string | undefined) => async (): Promise<string> => {
+      if (!keyId) return "";
+
+      const res = await apiCall<{ key: SecretApiKey }>(`/keys/reveal`, {
+        method: "POST",
+        body: JSON.stringify({
+          id: keyId,
+        }),
+      });
+      if (!res.key.key) {
+        throw new Error("Could not load the secret key");
+      }
+      return res.key.key;
+    },
+    [apiCall],
+  );
+
+  const onDelete = useCallback(
+    (keyId: string) => async () => {
+      if (!keyId) return;
+
+      await apiCall(`/keys`, {
+        method: "DELETE",
+        body: JSON.stringify({
+          id: keyId,
+        }),
+      });
+      mutate();
+    },
+    [mutate, apiCall],
+  );
+
+  const onToggleDisabled = useCallback(
+    (keyId: string | undefined, disabled: boolean) => async () => {
+      if (!keyId) return;
+      await apiCall(`/keys/${keyId}/disabled`, {
+        method: "PUT",
+        body: JSON.stringify({ disabled }),
+      });
+      mutate();
+    },
+    [apiCall, mutate],
+  );
+
+  const onRotate = useCallback(
+    async (keyId: string, gracePeriodHours: number) => {
+      const res = await apiCall<RotatedApiKey>(`/keys/${keyId}/rotate`, {
+        method: "POST",
+        body: JSON.stringify({ gracePeriodHours }),
+      });
+      mutate();
+      return res;
+    },
+    [apiCall, mutate],
+  );
+
+  const onRevokePrevious = useCallback(
+    async (keyId: string) => {
+      await apiCall(`/keys/${keyId}/previous-key`, { method: "DELETE" });
+      mutate();
+    },
+    [apiCall, mutate],
+  );
+
+  return (
+    <PersonalAccessTokens
+      onDelete={onDelete}
+      accessTokens={userKeys}
+      onCreate={mutate}
+      onReveal={onReveal}
+      onToggleDisabled={onToggleDisabled}
+      onRotate={onRotate}
+      onRevokePrevious={onRevokePrevious}
+    />
+  );
+};

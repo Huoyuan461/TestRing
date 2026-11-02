@@ -1,0 +1,79 @@
+// Shading and borders match NamespaceUsageGraph's bar.
+:global(.light-theme) {
+  --esv-bar-bg: var(--slate-5);
+  --esv-bar-shadow-top: var(--black-a3);
+  --esv-bar-shadow-bottom: var(--slate-a3);
+  --esv-bar-outline: transparent;
+  --esv-segment-shadow-top: var(--black-a2);
+  --esv-legend-outline: var(--slate-a8);
+}
+
+:global(.dark-theme) {
+  --esv-bar-bg: var(--black-a3);
+  --esv-bar-shadow-top: var(--black-a5);
+  --esv-bar-shadow-bottom: var(--slate-a2);
+  --esv-bar-outline: var(--slate-a3);
+  --esv-segment-shadow-top: var(--black-a4);
+  --esv-legend-outline: var(--white-a4);
+}
+
+.legend_box {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1.5px var(--esv-legend-outline);
+  background-color: var(--esv-bar-bg);
+}
+
+.bar_wrapper {
+  position: relative;
+  margin-top: 6px;
+}
+
+.bar_holder {
+  position: relative;
+  display: flex;
+  height: 24px;
+  border-radius: 4px;
+  overflow: hidden;
+  background-color: var(--esv-bar-bg);
+  box-shadow:
+    inset 0px 6px 4px -3px var(--esv-bar-shadow-top),
+    inset 0px 1px 2px 0px var(--esv-bar-shadow-top),
+    inset 0px -1px 0px 0px var(--esv-bar-shadow-bottom),
+    0px 0px 0px 1px var(--esv-bar-outline);
+}
+
+.previewBar {
+  position: relative;
+  height: 100%;
+  background-image: linear-gradient(
+    to bottom,
+    var(--esv-segment-shadow-top) 0px,
+    transparent 8px
+  );
+}
+
+.gapBar {
+  position: relative;
+  height: 100%;
+}
+
+.labels_row {
+  position: relative;
+  height: 16px;
+  margin-top: 4px;
+}
+
+.segmentLabel {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-size: var(--font-size-1);
+  line-height: var(--line-height-1);
+  color: var(--color-text-low);
+  white-space: nowrap;
+}

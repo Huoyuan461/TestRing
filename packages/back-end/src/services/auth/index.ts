@@ -1,0 +1,495 @@
+import { NextFunction, Request, Response } from "express";
+import { SSO_CONFIG } from "shared/enterprise";
+import { ExpressCookieStickyBucketService } from "@growthbook/growthbook";
+import {
+  hasSuperAdminPermission,
+  normalizeSuperAdmin,
+  userHasPermission,
+} from "shared/permissions";
+import { AuditInterface } from "shared/types/audit";
+import { Permission } from "shared/types/organization";
+import { UserInterface } from "shared/types/user";
+import {
+  EventUserForResponseLocals,
+  EventUserLoggedIn,
+} from "shared/types/events/event-types";
+import { logger } from "back-end/src/util/logger";
+import {
+  IS_CLOUD,
+  IS_LOCALHOST,
+  SUPER_ADMIN_AUTH_SUB_PREFIX,
+} from "back-end/src/util/secrets";
+import { AuthRequest } from "back-end/src/types/AuthRequest";
+import {
+  hasUser,
+  markUserAsVerified,
+  getUserByEmail,
+  getUserById,
+  setAuthSubject,
+} from "back-end/src/models/UserModel";
+import {
+  getOrganizationById,
+  isOrgScopedLogin,
+  validateLoginMethod,
+} from "back-end/src/services/organizations";
+import {
+  hasOrganization,
+  updateMember,
+} from "back-end/src/models/OrganizationModel";
+import {
+  IdTokenCookie,
+  AuthSecretCookie,
+  PendingSSOConnectionCookie,
+  RefreshTokenCookie,
+  SSOConnectionIdCookie,
+} from "back-end/src/util/cookie";
+import { getBuild } from "back-end/src/util/build";
+import { usingFileConfig } from "back-end/src/init/config";
+import { getUserPermissions } from "back-end/src/util/organization.util";
+import { insertAudit } from "back-end/src/models/AuditModel";
+import {
+  getLicenseMetaData,
+  getUserCodesForOrg,
+} from "back-end/src/services/licenseData";
+import { licenseInit, getEffectiveAccountPlan } from "back-end/src/enterprise";
+import {
+  getGrowthBookClient,
+  getGrowthBookRequestUrl,
+  getGrowthBookTrackingAttributes,
+  hashOrganizationId,
+} from "back-end/src/services/growthbook";
+import { TeamModel } from "back-end/src/models/TeamModel";
+import { ProjectModel } from "back-end/src/models/ProjectModel";
+import { AuthConnection } from "./AuthConnection";
+import { OpenIdAuthConnection } from "./OpenIdAuthConnection";
+import { LocalAuthConnection } from "./LocalAuthConnection";
+import {
+  canUseSuperAdmin,
+  getAuthSubjectAction,
+  getSignInMethodName,
+} from "./authChecks";
+
+type JWTInfo = {
+  email: string;
+  verified: boolean;
+  name: string;
+  issuedAt?: number;
+  sub?: string;
+  vercelInstallationId?: string;
+};
+
+type IdToken = {
+  email?: string;
+  user_email?: string;
+  email_verified?: boolean;
+  given_name?: string;
+  name?: string;
+  user_name?: string;
+  installation_id?: string;
+  sub?: string;
+  iat?: number;
+};
+
+export function getAuthConnection(): AuthConnection {
+  return usingOpenId() ? new OpenIdAuthConnection() : new LocalAuthConnection();
+}
+
+async function getUserFromJWT(info: JWTInfo): Promise<null | UserInterface> {
+  if (!info.email) {
+    throw new Error("Id token does not contain email address");
+  }
+  const user = await getUserByEmail(String(info.email));
+  if (!user) return null;
+
+  if (!usingOpenId() && user.minTokenDate && info.issuedAt) {
+    if (info.issuedAt < Math.floor(user.minTokenDate.getTime() / 1000)) {
+      throw new Error(
+        "Your session has been revoked. Please refresh the page and login.",
+      );
+    }
+  }
+
+  return user;
+}
+export function getInitialDataFromJWT(user: IdToken): JWTInfo {
+  // Vercel has special property names
+  if ("iss" in user && user.iss === "https://marketplace.vercel.com") {
+    return {
+      verified: true,
+      email: user["user_email"] || "",
+      name: user["user_name"] || "",
+      vercelInstallationId: user["installation_id"] || "",
+      sub: user.sub,
+    };
+  }
+
+  return {
+    verified: user.email_verified || false,
+    email: user.email || "",
+    name: user.name || user.given_name || "",
+    issuedAt: user.iat,
+    sub: user.sub,
+  };
+}
+
+export async function processJWT(
+  req: AuthRequest & { user: IdToken },
+  res: Response<unknown, EventUserForResponseLocals>,
+  next: NextFunction,
+): Promise<void> {
+  const parsedJWT = getInitialDataFromJWT(req.user);
+  const { email, name, verified } = parsedJWT;
+
+  req.authSubject = parsedJWT.sub || "";
+  req.email = email || "";
+  req.name = name || "";
+  req.verified = verified || false;
+  req.teams = [];
+  req.currentUser = {
+    id: "",
+    email: email || "",
+    superAdmin: false,
+    verified: verified || false,
+    name: name || "",
+  };
+  req.vercelInstallationId = parsedJWT.vercelInstallationId || "";
+
+  req.checkPermissions = (
+    permission: Permission,
+    project?: string | string[],
+    envs?: string[] | Set<string>,
+  ) => {
+    if (!req.userId || !req.organization) return false;
+
+    const userPermissions = getUserPermissions(
+      req.currentUser,
+      req.organization,
+      req.teams,
+      req.restrictedProjects,
+    );
+
+    if (
+      !userHasPermission(
+        userPermissions,
+        permission,
+        project,
+        envs ? [...envs] : undefined,
+      )
+    ) {
+      throw new Error("You do not have permission to complete that action.");
+    }
+  };
+
+  const user = await getUserFromJWT(parsedJWT);
+
+  if (user) {
+    const superAdminAllowed = canUseSuperAdmin({
+      orgScopedLogin: isOrgScopedLogin(req),
+      requireVerified: IS_CLOUD && !IS_LOCALHOST,
+      verified: !!req.verified,
+      authSubject: req.authSubject || "",
+      requiredSubPrefix: SUPER_ADMIN_AUTH_SUB_PREFIX,
+    });
+    req.currentUser = superAdminAllowed ? user : { ...user, superAdmin: false };
+    req.email = user.email;
+    req.userId = user.id;
+    req.name = user.name;
+    req.superAdmin = normalizeSuperAdmin(req.currentUser.superAdmin);
+
+    // If using default Cloud SSO (Auth0), once a user logs in with a verified email address,
+    // require all future logins to be verified too.
+    // This stops someone from creating an unverified email/password account and gaining access to
+    // an account using "Login with Google"
+    if (
+      IS_CLOUD &&
+      !IS_LOCALHOST &&
+      !req.loginMethod?.id &&
+      user.verified &&
+      !req.verified
+    ) {
+      res.status(406).json({
+        status: 406,
+        message: "You must log in via SSO to use TestRing",
+      });
+      return;
+    }
+
+    if (IS_CLOUD && !IS_LOCALHOST && !req.loginMethod?.id) {
+      const sub = req.authSubject || "";
+      const action = getAuthSubjectAction(
+        user.authSubject,
+        sub,
+        !!req.verified,
+      );
+      if (action === "reject") {
+        logger.warn(
+          { userId: user.id, authSubject: sub },
+          "Rejected login from an identity not bound to the user",
+        );
+        const method = getSignInMethodName(user.authSubject || "");
+        res.status(406).json({
+          status: 406,
+          message: `This account signs in with ${method}. Log out and sign in with ${method} instead.`,
+        });
+        return;
+      }
+      if (action === "bind") {
+        if (user.authSubject) {
+          logger.info(
+            { userId: user.id, from: user.authSubject, to: sub },
+            "Upgraded the user's bound login identity",
+          );
+        }
+        await setAuthSubject(user.id, sub);
+      }
+    }
+
+    if (!user.verified && req.verified) {
+      await markUserAsVerified(user.id);
+    }
+
+    if (req.headers["x-organization"]) {
+      req.organization =
+        (await getOrganizationById("" + req.headers["x-organization"])) ||
+        undefined;
+
+      if (req.organization) {
+        if (
+          req.organization.suspended &&
+          !hasSuperAdminPermission(req.superAdmin, "impersonate")
+        ) {
+          const allowedPaths = new Set(["GET /organization", "GET /user"]);
+          const currentPath = `${req.method} ${req.path}`;
+          if (!allowedPaths.has(currentPath)) {
+            res.status(403).json({
+              status: 403,
+              message:
+                "Account Suspended. Please contact support@testring.dev for assistance.",
+            });
+            return;
+          }
+        }
+
+        if (
+          !hasSuperAdminPermission(req.superAdmin, "impersonate") &&
+          !req.organization.members.filter((m) => m.id === req.userId).length
+        ) {
+          res.status(403).json({
+            status: 403,
+            message: "You do not have access to that organization",
+          });
+          return;
+        }
+
+        const memberRecord = req.organization.members.find(
+          (m) => m.id === req.userId,
+        );
+        if (memberRecord) {
+          const lastLoginDate = memberRecord.lastLoginDate;
+          const now = new Date();
+          const interval = 1000 * 60 * 60 * 12; // 12 hr
+          if (
+            !lastLoginDate ||
+            lastLoginDate.getTime() < now.getTime() - interval
+          ) {
+            try {
+              await updateMember(req.organization, memberRecord.id, {
+                lastLoginDate: now,
+              });
+            } catch (e) {
+              logger.error(
+                {
+                  organization: req.organization.id,
+                  member: memberRecord.id,
+                  err: e,
+                },
+                "error updating last login date",
+              );
+            }
+          }
+        }
+
+        [req.teams, req.restrictedProjects] = await Promise.all([
+          TeamModel.dangerousGetTeamsForOrganization(req.organization.id),
+          ProjectModel.dangerousGetRestrictedProjectIds(req.organization.id),
+        ]);
+
+        // Make sure this is a valid login method for the organization
+        try {
+          validateLoginMethod(req.organization, req);
+        } catch (e) {
+          res.status(403).json({
+            status: 403,
+            message: e.message,
+          });
+          return;
+        }
+
+        // init license for org if it exists
+        await licenseInit(
+          req.organization,
+          getUserCodesForOrg,
+          getLicenseMetaData,
+        );
+      } else {
+        res.status(404).json({
+          status: 404,
+          message: "Organization not found",
+        });
+        return;
+      }
+    }
+
+    const eventAudit: EventUserLoggedIn = {
+      type: "dashboard",
+      id: user.id,
+      email: user.email,
+      name: user.name || "",
+    };
+    res.locals.eventAudit = eventAudit;
+
+    req.audit = async (
+      data: Omit<
+        AuditInterface,
+        "user" | "organization" | "dateCreated" | "id"
+      >,
+    ) => {
+      await insertAudit({
+        ...data,
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name || "",
+        },
+        organization: req.organization?.id || "",
+        dateCreated: new Date(),
+      });
+    };
+
+    const gbClient = getGrowthBookClient();
+
+    if (gbClient) {
+      const build = getBuild();
+      const org = req.organization;
+      const orgId = org?.id || "";
+      const hashedOrganizationId = hashOrganizationId(orgId);
+
+      // Create sticky bucket service for Express
+      const stickyBucketService = new ExpressCookieStickyBucketService({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        req: req as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        res: res as any,
+      });
+
+      const trackingAttributes = getGrowthBookTrackingAttributes(req);
+
+      // Define user attributes
+      // Note: cloud and multiOrg are set as globalAttributes in growthbook.ts
+      const attributes = {
+        id: user.id,
+        user_id: user.id,
+        request_path: req.path,
+        freeSeats: org?.freeSeats,
+        discountCode: org?.discountCode,
+        organizationId: hashedOrganizationId,
+        cloudOrgId: IS_CLOUD ? orgId : "",
+        accountPlan: org ? getEffectiveAccountPlan(org) : "loading",
+        superAdmin: hasSuperAdminPermission(req.superAdmin, "view"),
+        orgDateCreated: org?.dateCreated
+          ? new Date(org.dateCreated).toISOString()
+          : "",
+        userDateCreated: user.dateCreated
+          ? new Date(user.dateCreated).toISOString()
+          : "",
+        ...trackingAttributes,
+        role: org?.members.find((m) => m.id === user.id)?.role,
+        hasLicenseKey: org?.licenseKey ? true : false,
+        configFile: usingFileConfig(),
+        usingSSO: usingOpenId(),
+        buildSHA: build.sha,
+        buildDate: build.date,
+        buildVersion: build.lastVersion,
+        orgOwnerJobTitle: org?.demographicData?.ownerJobTitle,
+        orgOwnerUsageIntents: org?.demographicData?.ownerUsageIntents,
+      };
+
+      try {
+        // Apply sticky bucketing and get user context
+        const userContext = await gbClient.applyStickyBuckets(
+          {
+            attributes,
+            url: getGrowthBookRequestUrl(req),
+            enableDevMode: true,
+          },
+          stickyBucketService,
+        );
+
+        // Create scoped instance for this request (reuses singleton)
+        req.gb = gbClient.createScopedInstance(userContext);
+      } catch (error) {
+        logger.error("Failed to create TestRing scoped instance", {
+          error,
+          userId: user.id,
+        });
+        // Continue without feature flags rather than failing request
+      }
+    }
+  } else {
+    req.audit = async () => {
+      throw new Error("No user in request");
+    };
+  }
+
+  next();
+}
+
+// For setting up anything that later acts as the stored user, since that carries their stored super admin
+export async function assertLoginGrantsStoredSuperAdmin(req: AuthRequest) {
+  if (!req.userId || req.superAdmin) return;
+  const user = await getUserById(req.userId);
+  if (normalizeSuperAdmin(user?.superAdmin)) {
+    throw new Error(
+      "Super admins must sign in with a method that grants super admin access before linking accounts that act as them.",
+    );
+  }
+}
+
+export function deleteAuthCookies(req: Request, res: Response) {
+  RefreshTokenCookie.setValue("", req, res);
+  IdTokenCookie.setValue("", req, res);
+  SSOConnectionIdCookie.setValue("", req, res);
+  AuthSecretCookie.setValue("", req, res);
+  PendingSSOConnectionCookie.setValue("", req, res);
+}
+
+export function validatePasswordFormat(password?: string): string {
+  if (!password) {
+    throw new Error("Password cannot be empty");
+  }
+  if (password.length < 8) {
+    throw new Error("Password must be at least 8 characters.");
+  }
+  if (password.length > 255) {
+    throw new Error("Password must be less than 256 characters.");
+  }
+
+  return password;
+}
+
+export async function isNewInstallation() {
+  if (await hasOrganization()) {
+    return false;
+  }
+  if (await hasUser()) {
+    return false;
+  }
+
+  return true;
+}
+
+export function usingOpenId() {
+  if (IS_CLOUD && !IS_LOCALHOST) return true;
+  if (SSO_CONFIG) return true;
+  return false;
+}

@@ -1,0 +1,458 @@
+import { useState, useEffect } from "react";
+import { OLD_TEMP_ROLLOUT_DAYS, StaleFeatureReason } from "shared/util";
+import { FeatureValueType } from "shared/types/feature";
+import { ago } from "shared/dates";
+import { PiArrowClockwise } from "react-icons/pi";
+// eslint-disable-next-line no-restricted-imports
+import { Badge, Box, Flex } from "@radix-ui/themes";
+import Text from "@/ui/Text";
+import Button from "@/ui/Button";
+import { Popover } from "@/ui/Popover";
+import Modal from "@/components/Modal";
+import ValueDisplay from "@/components/Features/ValueDisplay";
+import LoadingSpinner from "@/components/LoadingSpinner";
+import { FeatureHealthStateEntry } from "@/hooks/useFeatureHealthStates";
+import { useIncrementer } from "@/hooks/useIncrementer";
+import { isPartiallyStale } from "@/services/health";
+import { ExperimentDot } from "@/components/Experiment/TabbedPage/ExperimentStatusIndicator";
+import styles from "./StaleFeatureIcon.module.scss";
+
+const staleReasonToMessageMap: Record<StaleFeatureReason, string> = {
+  "never-stale": "Stale detection is disabled.",
+  "recently-updated": "Updated within the last two weeks.",
+  "active-draft": "Active draft in progress.",
+  "has-dependents": "Used by a non-stale dependent feature or experiment.",
+  "no-rules": "No rules defined.",
+  "rules-one-sided": "All reachable rules are one-sided.",
+  "abandoned-draft": "Draft not updated in over a month.",
+  "toggled-off": "Environment is disabled.",
+  "active-experiment": "Live experiment rule in this environment.",
+  "temp-rollout": "Temp rollout from a recently stopped experiment.",
+  "old-temp-rollout": `Only serves a temp rollout from an experiment stopped ${OLD_TEMP_ROLLOUT_DAYS}+ days ago.`,
+  "has-rules": "Has rules with targeting conditions.",
+  error: "Error evaluating staleness.",
+};
+
+function VerdictChip({
+  color,
+  label,
+}: {
+  color: "yellow" | "green" | "gray";
+  label: string;
+}) {
+  return (
+    <Flex gap="1" align="center" style={{ whiteSpace: "nowrap" }}>
+      <ExperimentDot color={color} />
+      {label}
+    </Flex>
+  );
+}
+
+export default function StaleFeatureIcon({
+  neverStale,
+  valueType,
+  staleData,
+  fetchStaleData,
+  onDisable,
+  context = "detail",
+  open: controlledOpen,
+  onOpenChange,
+}: {
+  neverStale?: boolean;
+  valueType?: FeatureValueType;
+  staleData?: FeatureHealthStateEntry;
+  fetchStaleData?: () => Promise<void>;
+  onDisable?: () => void;
+  context?: "list" | "detail";
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const [rerunning, setRerunning] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const [, tick] = useIncrementer();
+  useEffect(() => {
+    const id = setInterval(tick, 60_000);
+    return () => clearInterval(id);
+  }, [tick]);
+
+  const isControlled = controlledOpen !== undefined;
+  const open = isControlled ? controlledOpen : internalOpen;
+  const setOpen = (v: boolean) => {
+    if (!isControlled) setInternalOpen(v);
+    onOpenChange?.(v);
+  };
+
+  // neverStale can be known from the feature prop before staleData loads
+  const effectiveNeverStale = neverStale ?? staleData?.neverStale ?? false;
+
+  const neverStaleContent = (
+    <Box>
+      <Flex direction="column" gap="4">
+        <Box>
+          <span style={{ color: "var(--gray-11)" }}>
+            <Text size="lg" weight="semibold">
+              Stale detection off
+            </Text>
+          </span>
+          <Text as="div" size="md" color="text-low" mt="1">
+            Stale detection is disabled for this feature.
+          </Text>
+        </Box>
+      </Flex>
+      {onDisable && (
+        <Flex justify="end" mt="4">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setOpen(false);
+              onDisable();
+            }}
+          >
+            Enable stale detection
+          </Button>
+        </Flex>
+      )}
+    </Box>
+  );
+
+  // Show the permanent badge immediately — no staleData needed
+  if (effectiveNeverStale) {
+    if (context === "list") {
+      return (
+        <Popover
+          open={open}
+          onOpenChange={setOpen}
+          side="bottom"
+          align="start"
+          showArrow={true}
+          contentStyle={{ maxWidth: 600, textAlign: "left" }}
+          trigger={
+            <span className={styles.listTrigger}>
+              <VerdictChip color="gray" label="Stale detection off" />
+            </span>
+          }
+          content={neverStaleContent}
+        />
+      );
+    }
+
+    return (
+      <>
+        <Badge
+          color="green"
+          variant="soft"
+          radius="full"
+          size="2"
+          className={styles.freshBadge}
+          onClick={() => setOpen(true)}
+        >
+          Stale detection off
+        </Badge>
+        {open && (
+          <Modal
+            open={open}
+            close={() => setOpen(false)}
+            header="Stale Status"
+            trackingEventModalType="stale-feature-status"
+            closeCta="Close"
+          >
+            {neverStaleContent}
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  if (!staleData) {
+    const loadingContent = (
+      <Box>
+        <LoadingSpinner />
+      </Box>
+    );
+    if (context === "list") {
+      return (
+        <span style={{ whiteSpace: "nowrap" }}>
+          <Text size="sm" color="text-low">
+            Computing staleness…
+          </Text>
+        </span>
+      );
+    }
+    return (
+      <>
+        <Badge
+          color="gray"
+          variant="soft"
+          radius="full"
+          size="2"
+          className={styles.permanentBadge}
+          onClick={() => setOpen(true)}
+        >
+          —
+        </Badge>
+        {open && (
+          <Modal
+            open={open}
+            close={() => setOpen(false)}
+            header="Stale Status"
+            trackingEventModalType="stale-feature-status"
+            closeCta="Close"
+          >
+            {loadingContent}
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  const staleReason: StaleFeatureReason | undefined = staleData.reason;
+  const envResults = staleData.envResults ?? {};
+  const computedAt = staleData.computedAt;
+
+  const mixed = isPartiallyStale(staleData);
+
+  const envEntries = Object.entries(envResults);
+
+  const handleRerun = fetchStaleData
+    ? async () => {
+        setRerunning(true);
+        try {
+          await fetchStaleData();
+        } finally {
+          setRerunning(false);
+        }
+      }
+    : undefined;
+
+  const body = (
+    <Box>
+      <Flex direction="column" gap="4">
+        <Box>
+          <Text
+            as="div"
+            size="sm"
+            weight="semibold"
+            color="text-mid"
+            textTransform="uppercase"
+            mb="1"
+          >
+            Overall Status
+          </Text>
+          {staleData.stale ? (
+            <span style={{ color: "var(--yellow-11)" }}>
+              <Text size="lg" weight="semibold">
+                Stale
+              </Text>
+            </span>
+          ) : (
+            <span style={{ color: "var(--green-10)" }}>
+              <Text size="lg" weight="semibold">
+                Not stale
+              </Text>
+              {mixed && (
+                <Text as="div" size="md" color="text-low" mt="1">
+                  Some environments are stale. See the breakdown below.
+                </Text>
+              )}
+            </span>
+          )}
+        </Box>
+
+        {staleReason && (
+          <Box>
+            <Text
+              as="div"
+              size="sm"
+              weight="semibold"
+              color="text-mid"
+              textTransform="uppercase"
+              mb="1"
+            >
+              Reason
+            </Text>
+            <Text size="md" as="div">
+              {staleReasonToMessageMap[staleReason]}
+            </Text>
+          </Box>
+        )}
+
+        {envEntries.length > 0 && (
+          <Box mt="4">
+            <Text
+              as="div"
+              size="sm"
+              weight="semibold"
+              color="text-mid"
+              textTransform="uppercase"
+            >
+              Environment Statuses
+            </Text>
+
+            <Box mt="2" style={{ maxHeight: 300, overflowY: "auto" }}>
+              <table
+                className="table table-sm table-valign-top"
+                style={{ tableLayout: "fixed", width: "100%" }}
+              >
+                <thead>
+                  <tr>
+                    <th style={{ width: "20%" }} />
+                    <th style={{ width: "15%" }}>Status</th>
+                    <th style={{ width: "25%" }}>Reason</th>
+                    <th>Evaluates to</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {envEntries.map(([envId, info]) => (
+                    <tr key={envId} style={{ verticalAlign: "top" }}>
+                      <td style={{ overflow: "hidden" }}>
+                        <Text size="md" weight="medium" truncate title={envId}>
+                          {envId}
+                        </Text>
+                      </td>
+                      <td>
+                        {info.stale ? (
+                          <span style={{ color: "var(--yellow-11)" }}>
+                            <Text weight="semibold">Stale</Text>
+                          </span>
+                        ) : (
+                          <span style={{ color: "var(--green-10)" }}>
+                            <Text weight="semibold">Not Stale</Text>
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        <Text size="sm" color="text-mid">
+                          {info.reason
+                            ? (staleReasonToMessageMap[
+                                info.reason as StaleFeatureReason
+                              ] ?? info.reason)
+                            : null}
+                        </Text>
+                      </td>
+                      <td>
+                        {info.evaluatesTo !== undefined &&
+                          (info.reason === "toggled-off" || !valueType) && (
+                            <span
+                              style={{
+                                fontFamily: "var(--code-font-family)",
+                                fontSize: "0.85em",
+                              }}
+                            >
+                              {info.evaluatesTo}
+                            </span>
+                          )}
+                        {info.evaluatesTo !== undefined &&
+                          info.reason !== "toggled-off" &&
+                          valueType && (
+                            <ValueDisplay
+                              value={info.evaluatesTo}
+                              type={valueType}
+                              fullStyle={{
+                                maxHeight: 80,
+                                overflowY: "auto",
+                                maxWidth: "100%",
+                              }}
+                            />
+                          )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Box>
+          </Box>
+        )}
+      </Flex>
+      {(handleRerun || onDisable || computedAt) && (
+        <Flex direction="column" align="end" gap="2" mt="2">
+          {computedAt && (
+            <Text size="sm" color="text-low">
+              Last calculated: {ago(new Date(computedAt))}
+            </Text>
+          )}
+          {(handleRerun || onDisable) && (
+            <Flex gap="2">
+              {handleRerun && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={handleRerun}
+                  disabled={rerunning}
+                >
+                  {rerunning ? <LoadingSpinner /> : <PiArrowClockwise />} Re-run
+                </Button>
+              )}
+              {onDisable && (
+                <Button
+                  size="sm"
+                  color="red"
+                  variant="outline"
+                  onClick={() => {
+                    setOpen(false);
+                    onDisable();
+                  }}
+                >
+                  Disable stale detection
+                </Button>
+              )}
+            </Flex>
+          )}
+        </Flex>
+      )}
+    </Box>
+  );
+
+  const badgeColor = staleData.stale ? "yellow" : "green";
+  const badgeClass = staleData.stale ? styles.staleBadge : styles.freshBadge;
+  const label = staleData.stale ? "Stale" : mixed ? "Not stale*" : "Not stale";
+
+  if (context === "list") {
+    return (
+      <Popover
+        open={open}
+        onOpenChange={setOpen}
+        side="bottom"
+        align="start"
+        showArrow={true}
+        contentStyle={{ maxWidth: 600, textAlign: "left" }}
+        trigger={
+          <span className={styles.listTrigger}>
+            <VerdictChip
+              color={staleData.stale ? "yellow" : "green"}
+              label={label}
+            />
+          </span>
+        }
+        content={body}
+      />
+    );
+  }
+
+  return (
+    <>
+      <Badge
+        color={badgeColor}
+        variant="soft"
+        radius="full"
+        size="2"
+        className={badgeClass}
+        onClick={() => setOpen(true)}
+      >
+        {label}
+      </Badge>
+      {open && (
+        <Modal
+          open={open}
+          close={() => setOpen(false)}
+          header="Stale Status"
+          trackingEventModalType="stale-feature-status"
+          closeCta="Close"
+          size="lg"
+        >
+          {body}
+        </Modal>
+      )}
+    </>
+  );
+}

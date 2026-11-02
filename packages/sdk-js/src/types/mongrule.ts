@@ -1,0 +1,135 @@
+import type { SavedGroupsPayload } from "./growthbook";
+
+type OrCondition = {
+  $or: ConditionInterface[];
+};
+type NorCondition = {
+  $nor: ConditionInterface[];
+};
+type AndCondition = {
+  $and: ConditionInterface[];
+};
+type NotCondition = {
+  $not: ConditionInterface;
+};
+/** Names one saved group. Unknown keys are ignored. */
+export type SavedGroupReference = {
+  id: string;
+  /** Optional. Checks this attribute instead of the entry's own. */
+  attributeKey?: string;
+};
+
+/**
+ * A reference to one saved group. Top level like `$and`, not scoped to an
+ * attribute. The plural authoring operator `$savedGroups` never reaches an
+ * SDK, so it has no type here.
+ */
+export type SavedGroupCondition = {
+  $savedGroup: SavedGroupReference;
+};
+export type Operator =
+  | "$in"
+  | "$ini"
+  | "$inGroup"
+  | "$nin"
+  | "$nini"
+  | "$notInGroup"
+  | "$gt"
+  | "$gte"
+  | "$lt"
+  | "$lte"
+  | "$regex"
+  | "$regexi"
+  | "$ne"
+  | "$eq"
+  | "$size"
+  | "$elemMatch"
+  | "$all"
+  | "$alli"
+  | "$not"
+  | "$type"
+  | "$exists"
+  | "$vgt"
+  | "$vgte"
+  | "$vlt"
+  | "$vlte"
+  | "$vne"
+  | "$veq";
+export type VarType =
+  | "string"
+  | "number"
+  | "boolean"
+  | "array"
+  | "object"
+  | "null"
+  | "undefined";
+export type ConditionTypeMismatch = {
+  path: string;
+  /** `$eq` for implicit equality */
+  operator: string;
+  /** Condition value */
+  expected: unknown;
+  /** Attribute value, `null` when missing */
+  actual: unknown;
+};
+export type TypeMismatchCallback = (mismatch: ConditionTypeMismatch) => void;
+export type EvalConditionOptions = {
+  /** Required for saved group operators to match anyone */
+  savedGroups?: SavedGroupsPayload;
+  onTypeMismatch?: TypeMismatchCallback;
+};
+export type OperatorConditionValue = {
+  $in?: (string | number)[];
+  $ini?: (string | number)[];
+  $inGroup?: string;
+  $nin?: (string | number)[];
+  $nini?: (string | number)[];
+  $notInGroup?: string;
+  $gt?: number | string;
+  $gte?: number | string;
+  $lt?: number | string;
+  $lte?: number | string;
+  $regex?: string;
+  $regexi?: string;
+  $ne?: number | string;
+  $eq?: number | string;
+  $exists?: boolean;
+  $all?: ConditionValue[];
+  $alli?: ConditionValue[];
+  $size?: number | ConditionValue;
+  $type?: VarType;
+  $elemMatch?: ConditionInterface | OperatorConditionValue;
+  $not?: ConditionValue;
+};
+
+export type ConditionValue =
+  | OperatorConditionValue
+  | string
+  | number
+  | boolean
+  // eslint-disable-next-line
+  | Array<any>
+  // eslint-disable-next-line
+  | Record<string, any>
+  | null;
+
+export type OperatorCondition = {
+  [key: string]: ConditionValue;
+};
+
+export type ConditionInterface =
+  | OrCondition
+  | NorCondition
+  | AndCondition
+  | NotCondition
+  | SavedGroupCondition
+  | OperatorCondition;
+
+export type ParentConditionInterface = {
+  id: string;
+  condition: ConditionInterface;
+  gate?: boolean;
+};
+
+// eslint-disable-next-line
+export type TestedObj = Record<string, any>;
